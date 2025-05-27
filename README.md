@@ -2,7 +2,7 @@
 
 本项目是[天池大赛 - 中文NLP地址要素解析学习赛](https://tianchi.aliyun.com/competition/entrance/531900/information)的赛道二的代码。下面是长期赛的提交结果。
 
-![result.png](C:\Users\wu_mi\PycharmProjects\tianchi\images\result.png)
+![result.png](./images/result.png)
 
 ## 技术方案
 
