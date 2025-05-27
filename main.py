@@ -3,11 +3,11 @@ import numpy as np
 import torch
 import random
 from config import Config
-from trainer import KFoldTrainer, SingleTrainer  # Updated import
-# For reading train/dev data from dataset import NERDataset # For creating datasets for training
-# For creating DataLoaders for training
+from trainer import KFoldTrainer, SingleTrainer  # 更新的导入
+# 用于读取训练/验证数据，从dataset导入NERDataset用于创建训练数据集
+# 用于创建训练的DataLoaders
 
-# Setup logging
+# 设置日志
 from logger import logger
 
 
@@ -21,12 +21,12 @@ def set_seed(seed_value):
 
 
 def main():
-    # Load main configuration
-    # The Config class now loads from YAML within its __init__
+    # 加载主配置
+    # Config类现在在其__init__方法中从YAML加载配置
     config = Config(config_path='config.yaml')
 
     set_seed(config.seed)
-    os.makedirs(config.work_dir, exist_ok=True)  # Main work directory
+    os.makedirs(config.work_dir, exist_ok=True)  # 主工作目录
 
     # trainer = KFoldTrainer(config=config)
     # trainer.kfold_train()

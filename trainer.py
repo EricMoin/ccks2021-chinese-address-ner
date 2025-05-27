@@ -21,39 +21,39 @@ logger = logging.getLogger(__name__)
 class StochasticWeightAveraging:
     def __init__(self, model, swa_start_epoch, swa_lr=None, swa_freq=5):
         """
-        Implements Stochastic Weight Averaging (SWA)
+        实现随机权重平均（SWA）
         Args:
-            model: The model to apply SWA to
-            swa_start_epoch: The epoch to start averaging weights (0-indexed)
-            swa_lr: The learning rate to use during SWA (currently not used for optimizer re-init)
-            swa_freq: How frequently (in epochs) to update the SWA model
+            model: 要应用SWA的模型
+            swa_start_epoch: 开始平均权重的轮次（从0开始索引）
+            swa_lr: SWA期间使用的学习率（目前不用于优化器重新初始化）
+            swa_freq: 更新SWA模型的频率（以轮次为单位）
         """
-        self.model_base = model  # Keep a reference to the original model structure for deepcopy
+        self.model_base = model  # 保持对原始模型结构的引用以进行深拷贝
         self.swa_start_epoch = swa_start_epoch
-        # Note: SWA LR is often handled by scheduler or fixed small LR during SWA phase
+        # 注意：SWA学习率通常由调度器处理或在SWA阶段使用固定的小学习率
         self.swa_lr = swa_lr
         self.swa_freq = swa_freq
         self.swa_model = None
         self.n_averaged = 0
         logger.info(
-            f"SWA initialized: start_epoch={swa_start_epoch}, lr={swa_lr}, freq={swa_freq}")
+            f"SWA已初始化: start_epoch={swa_start_epoch}, lr={swa_lr}, freq={swa_freq}")
 
     def update(self, epoch, model_current_state):
-        """Update the SWA model by averaging with current model weights"""
+        """通过与当前模型权重平均来更新SWA模型"""
         if epoch < self.swa_start_epoch:
             return
 
         if (epoch - self.swa_start_epoch) % self.swa_freq != 0:
             return
 
-        logger.info(f"Updating SWA model at epoch {epoch}")
+        logger.info(f"在第{epoch}轮更新SWA模型")
         if self.swa_model is None:
-            # Create SWA model from base structure
+            # 从基础结构创建SWA模型
             self.swa_model = copy.deepcopy(self.model_base)
             self.swa_model.load_state_dict(copy.deepcopy(model_current_state))
-            logger.info("SWA model initialized with current model weights.")
+            logger.info("SWA模型已用当前模型权重初始化。")
         else:
-            # Update running average of parameters
+            # 更新参数的运行平均值
             current_params = dict(model_current_state)
             for name, swa_param in self.swa_model.named_parameters():
                 if swa_param.requires_grad:
@@ -63,16 +63,16 @@ class StochasticWeightAveraging:
                     swa_param.data.add_(
                         model_param.data / (self.n_averaged + 1))
             logger.info(
-                f"SWA model updated. n_averaged became {self.n_averaged + 1}")
+                f"SWA模型已更新。n_averaged变为{self.n_averaged + 1}")
         self.n_averaged += 1
 
     def get_final_model_state_dict(self):
-        """Return the SWA model's state_dict with averaged weights"""
+        """返回具有平均权重的SWA模型的state_dict"""
         if self.swa_model is None:
             logger.warning(
-                "SWA was enabled, but no averaging was done. Returning None for SWA model state_dict.")
+                "SWA已启用，但未进行平均。为SWA模型state_dict返回None。")
             return None
-        logger.info("Final SWA model state_dict retrieved.")
+        logger.info("已检索最终SWA模型state_dict。")
         return self.swa_model.state_dict()
 
 
@@ -89,12 +89,12 @@ class Trainer:
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.device = torch.device(device)
-        self.scheduler = None  # Initialize scheduler attribute
+        self.scheduler = None  # 初始化调度器属性
 
-        # Initialize SWA if enabled
+        # 如果启用则初始化SWA
         if self.config.use_swa:
             self.swa = StochasticWeightAveraging(
-                model=self.model,  # Pass the model instance for deepcopy base
+                model=self.model,  # 传递模型实例用于深拷贝基础
                 swa_start_epoch=self.config.swa_start_epoch,
                 swa_lr=self.config.swa_lr,
                 swa_freq=self.config.swa_freq
@@ -104,11 +104,11 @@ class Trainer:
 
         self.model.to(self.device)
         logger.info(
-            f"Trainer initialized for training. Training on {self.device}. Work directory: {self.config.work_dir}")
+            f"训练器已初始化。在{self.device}上训练。工作目录：{self.config.work_dir}")
 
     def train(self):
-        self.model.train()  # Ensure model is in training mode
-        # Optimizer
+        self.model.train()  # 确保模型处于训练模式
+        # 优化器
         optimizer = torch.optim.AdamW([
             {'params': self.model.bert.embeddings.parameters(
             ), 'lr': self.config.learning_rate * 5},
@@ -126,7 +126,7 @@ class Trainer:
         )
 
         best_val_metric = 0
-        # Fold specific work_dir
+        # 折叠特定的工作目录
         os.makedirs(self.config.work_dir, exist_ok=True)
 
         freelb = None
@@ -140,7 +140,7 @@ class Trainer:
                 adv_norm_type=self.config.freelb_adv_norm_type,
                 base_model=self.config.freelb_base_model
             )
-            logger.info("FreeLB adversarial training is configured.")
+            logger.info("FreeLB对抗训练已配置。")
 
         for epoch in range(self.config.num_epochs):
             self.model.train()
@@ -156,23 +156,23 @@ class Trainer:
                 optimizer.zero_grad()
 
                 if freelb and epoch >= self.config.adversarial_training_start_epoch:
-                    # Get original embeddings for FreeLB
+                    # 获取FreeLB的原始嵌入
                     original_embeddings = self.model.bert.embeddings.word_embeddings(
                         input_ids)
-                    # FreeLB's .attack() method will handle its own gradient accumulation
-                    # and self.model.zero_grad() internally before its loop.
+                    # FreeLB的.attack()方法将处理自己的梯度累积
+                    # 并在其循环之前内部调用self.model.zero_grad()。
                     adv_loss = freelb.attack(
                         original_embeddings.detach(), attention_mask, labels)
-                    # The gradients are now accumulated in model.parameters() from FreeLB's attack.
-                    # We use adv_loss for logging, but the gradients for optimizer.step() are from FreeLB.
-                    current_loss = adv_loss  # For logging purposes
+                    # 梯度现在已从FreeLB的攻击中在model.parameters()中累积。
+                    # 我们使用adv_loss进行日志记录，但optimizer.step()的梯度来自FreeLB。
+                    current_loss = adv_loss  # 用于日志记录目的
                 else:
-                    # Standard forward and backward pass if FreeLB is not active
+                    # 如果FreeLB未激活，则进行标准前向和后向传播
                     loss = self.model(input_ids, attention_mask, labels)
                     loss.backward()
                     current_loss = loss.item()
 
-                # Gradient clipping and optimizer step (applies to gradients from either standard pass or FreeLB)
+                # 梯度裁剪和优化器步骤（适用于标准传播或FreeLB的梯度）
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -180,16 +180,16 @@ class Trainer:
                 if self.scheduler:
                     self.scheduler.step()
 
-                train_loss += current_loss  # Accumulate the loss for the epoch average
+                train_loss += current_loss  # 累积损失以计算轮次平均值
                 train_pbar.set_postfix({"loss": f"{current_loss:.4f}"})
 
             avg_train_loss = train_loss / \
                 len(self.train_dataloader) if len(
                     self.train_dataloader) > 0 else 0
             logger.info(
-                f"Epoch {epoch+1} ({os.path.basename(self.config.work_dir)}) avg training loss: {avg_train_loss:.4f}")
+                f"第{epoch+1}轮 ({os.path.basename(self.config.work_dir)}) 平均训练损失: {avg_train_loss:.4f}")
 
-            # Evaluation
+            # 评估
             self.model.eval()
             all_preds_eval = []
             all_labels_eval = []
@@ -223,25 +223,25 @@ class Trainer:
                 all_preds_eval) > 0 else 1
             current_val_metric = correct_eval / total_eval
             logger.info(
-                f"Epoch {epoch+1} ({os.path.basename(self.config.work_dir)}) Val Loss: {avg_eval_loss:.4f}, Val Acc: {current_val_metric:.4f}")
+                f"第{epoch+1}轮 ({os.path.basename(self.config.work_dir)}) 验证损失: {avg_eval_loss:.4f}, 验证准确率: {current_val_metric:.4f}")
 
             if total_eval > 0:
-                # Generate and log classification report
-                # Ensure all_preds_eval and all_labels_eval are flat lists of integers (label IDs)
-                # Get label names from id
+                # 生成并记录分类报告
+                # 确保all_preds_eval和all_labels_eval是整数（标签ID）的扁平列表
+                # 从id获取标签名称
                 target_names = [self.config.label_map.id2label[i] for i in sorted(
                     list(set(all_labels_eval + all_preds_eval)))]
-                # Filter out OOD labels if any from target_names before passing to classification_report
-                # This assumes your label_map.id2label correctly maps all occurring IDs.
-                # It's also important that all_preds_eval and all_labels_eval contain numerical IDs.
+                # 在传递给classification_report之前从target_names中过滤掉任何OOD标签
+                # 这假设您的label_map.id2label正确映射所有出现的ID。
+                # all_preds_eval和all_labels_eval包含数字ID也很重要。
 
-                # Handle cases where some labels might only appear in preds or true labels
-                # and might not be in the initial set of labels (if id2label is not exhaustive)
-                # We'll use labels present in either preds or true, and map them.
+                # 处理某些标签可能只出现在预测或真实标签中的情况
+                # 并且可能不在初始标签集中（如果id2label不详尽）
+                # 我们将使用预测或真实中存在的标签，并映射它们。
                 present_label_ids = sorted(
                     list(set(all_labels_eval).union(set(all_preds_eval))))
 
-                # Ensure all these IDs have a mapping in id2label
+                # 确保所有这些ID在id2label中都有映射
                 valid_target_names = []
                 valid_label_ids_for_report = []
 
@@ -252,26 +252,26 @@ class Trainer:
                         valid_label_ids_for_report.append(label_id)
                     else:
                         logger.warning(
-                            f"Label ID {label_id} found in predictions/gold labels but not in id2label map. Skipping for report.")
+                            f"标签ID {label_id} 在预测/金标准标签中找到，但不在id2label映射中。跳过报告。")
 
-                if valid_label_ids_for_report:  # Proceed only if there are valid labels to report
+                if valid_label_ids_for_report:  # 仅在有有效标签要报告时继续
                     try:
                         report = classification_report(
                             all_labels_eval,
                             all_preds_eval,
-                            labels=valid_label_ids_for_report,  # Use only IDs that have a name
-                            target_names=valid_target_names,   # Corresponding names
+                            labels=valid_label_ids_for_report,  # 仅使用有名称的ID
+                            target_names=valid_target_names,   # 对应的名称
                             digits=4,
-                            zero_division=0  # Avoids warnings when a class has no predictions or no true samples
+                            zero_division=0  # 避免当某个类别没有预测或没有真实样本时的警告
                         )
                         logger.info(
-                            f"Classification Report for Epoch {epoch+1} ({os.path.basename(self.config.work_dir)}):\n{report}")
+                            f"第{epoch+1}轮分类报告 ({os.path.basename(self.config.work_dir)}):\n{report}")
                     except ValueError as e:
                         logger.error(
-                            f"Could not generate classification report: {e}. Preds: {set(all_preds_eval)}, Labels: {set(all_labels_eval)}")
+                            f"无法生成分类报告: {e}. 预测: {set(all_preds_eval)}, 标签: {set(all_labels_eval)}")
                 else:
                     logger.warning(
-                        "No valid labels found to generate classification report (all predicted/gold labels were unmappable).")
+                        "未找到有效标签来生成分类报告（所有预测/金标准标签都无法映射）。")
 
             if self.swa is not None:
                 self.swa.update(epoch, self.model.state_dict())
@@ -289,21 +289,21 @@ class Trainer:
             if current_val_metric > best_val_metric:
                 best_val_metric = current_val_metric
                 saved_path = os.path.join(
-                    self.config.work_dir, "best_model.pt")  # Saved in fold-specific dir
+                    self.config.work_dir, "best_model.pt")  # 保存在折叠特定目录中
                 torch.save(self.model.state_dict(), saved_path)
                 logger.info(
-                    f"Saved new best model ({os.path.basename(self.config.work_dir)}) with val metric: {current_val_metric:.4f} to {saved_path}")
+                    f"保存新的最佳模型 ({os.path.basename(self.config.work_dir)}) 验证指标: {current_val_metric:.4f} 到 {saved_path}")
 
         if self.swa is not None:
             swa_model_state_dict = self.swa.get_final_model_state_dict()
             if swa_model_state_dict is not None:
                 swa_save_path = os.path.join(
-                    self.config.work_dir, "swa_model.pt")  # Saved in fold-specific dir
+                    self.config.work_dir, "swa_model.pt")  # 保存在折叠特定目录中
                 torch.save(swa_model_state_dict, swa_save_path)
                 logger.info(
-                    f"Saved final SWA model ({os.path.basename(self.config.work_dir)}) to {swa_save_path}")
+                    f"保存最终SWA模型 ({os.path.basename(self.config.work_dir)}) 到 {swa_save_path}")
         logger.info(
-            f"Training finished for work directory: {self.config.work_dir}")
+            f"工作目录训练完成: {self.config.work_dir}")
 
 
 class KFoldTrainer:
@@ -311,16 +311,16 @@ class KFoldTrainer:
         self.config = config
 
     def kfold_train(self):
-        logger.info("--- Starting K-Fold Training Pipeline ---")
+        logger.info("--- 开始K折训练流水线 ---")
         folds_base_dir = os.path.join(
             self.config.work_dir, self.config.model_name)
         os.makedirs(folds_base_dir, exist_ok=True)
         logger.info(
-            f"Base directory for K-Folds of model '{self.config.model_name}': {folds_base_dir}")
+            f"模型 '{self.config.model_name}' 的K折基础目录: {folds_base_dir}")
 
         multi_reader = MultiConllReader()
         full_data_conll = list(multi_reader.read(
-            # List of Sentence objects
+            # 句子对象列表
             [self.config.train_file, self.config.dev_file]))
 
         kf = KFold(n_splits=self.config.k_folds, shuffle=True,
@@ -329,27 +329,27 @@ class KFoldTrainer:
         for fold_idx, (train_indices, val_indices) in enumerate(kf.split(full_data_conll)):
             fold_num = fold_idx + 1
             logger.info(
-                f"--- Processing Fold {fold_num}/{self.config.k_folds} for model '{self.config.model_name}' ---")
+                f"--- 处理模型 '{self.config.model_name}' 的第 {fold_num}/{self.config.k_folds} 折 ---")
 
             fold_train_data = [full_data_conll[i] for i in train_indices]
             fold_val_data = [full_data_conll[i] for i in val_indices]
 
-            # Create a specific config for this fold
-            # Start with a copy of the main config
+            # 为此折创建特定配置
+            # 从主配置开始复制
             fold_cfg = copy.deepcopy(self.config)
             fold_cfg.work_dir = os.path.join(
                 folds_base_dir, f"fold_{fold_num}")
-            # model_name for AddressNER should be the adapted model path being k-folded
+            # AddressNER的model_name应该是正在进行k折的适配模型路径
             fold_cfg.model_name = self.config.model_name
             os.makedirs(fold_cfg.work_dir, exist_ok=True)
             logger.info(
-                f"Fold {fold_num} config: work_dir='{fold_cfg.work_dir}', model_name_for_tokenizer='{fold_cfg.model_name}'")
+                f"第{fold_num}折配置: work_dir='{fold_cfg.work_dir}', model_name_for_tokenizer='{fold_cfg.model_name}'")
 
-            # Instantiate model for this fold (uses fold_cfg.model_name for tokenizer)
+            # 为此折实例化模型（使用fold_cfg.model_name作为分词器）
             model = AddressNER(num_labels=len(
                 fold_cfg.label_map.labels), config=fold_cfg)
 
-            # Create datasets and dataloaders for this fold
+            # 为此折创建数据集和数据加载器
             train_dataset = NERDataset(
                 fold_train_data, model.tokenizer, fold_cfg.label_map.label2id)
             val_dataset = NERDataset(
@@ -359,14 +359,14 @@ class KFoldTrainer:
             val_loader = DataLoader(val_dataset, batch_size=fold_cfg.batch_size,
                                     shuffle=False, num_workers=4, pin_memory=True)
 
-            # Instantiate and run trainer for this fold
+            # 为此折实例化并运行训练器
             trainer_fold = Trainer(config=fold_cfg,
                                    model=model,
                                    train_dataloader=train_loader,
                                    val_dataloader=val_loader,
                                    device=fold_cfg.device)
-            trainer_fold.train()  # This will save best_model.pt and swa_model.pt in fold_cfg.work_dir
-        logger.info("--- K-Fold Training Pipeline Finished ---")
+            trainer_fold.train()  # 这将在fold_cfg.work_dir中保存best_model.pt和swa_model.pt
+        logger.info("--- K折训练流水线完成 ---")
 
 
 class SingleTrainer:
@@ -392,7 +392,7 @@ class SingleTrainer:
         val_loader = DataLoader(val_dataset, batch_size=self.config.batch_size,
                                 shuffle=False, num_workers=4, pin_memory=True)
 
-        # Instantiate and run trainer for this fold
+        # 实例化并运行训练器
         trainer = Trainer(config=self.config,
                           model=model,
                           train_dataloader=train_loader,

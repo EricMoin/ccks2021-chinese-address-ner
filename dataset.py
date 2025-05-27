@@ -30,12 +30,12 @@ class NERDataset(Dataset):
         self.label_map = label_map
 
     def __getitem__(self, index: int) -> dict:
-        # Initialize empty lists
+        # 初始化空列表
         tokens = []
         labels = []
         is_prompt = False
 
-        # Process all tokens/labels
+        # 处理所有标记/标签
         for token, label in zip(self.data[index].tokens, self.data[index].labels):
             if token == "<EOS>":
                 is_prompt = True
@@ -53,18 +53,18 @@ class NERDataset(Dataset):
             return_tensors="pt",
         )
 
-        # Convert labels to tensor with fallback to "O" for unknown labels
+        # 将标签转换为张量，对未知标签回退到"O"
         label_ids = []
         for label in labels:
             if label in self.label_map:
                 label_ids.append(self.label_map[label])
             else:
-                # Use "O" (Outside) tag for unknown labels
+                # 对未知标签使用"O"（外部）标签
                 label_ids.append(self.label_map["O"])
                 print(
-                    f"Warning: Unknown label '{label}' found, using 'O' instead")
+                    f"警告: 发现未知标签 '{label}'，使用 'O' 代替")
 
-        # Pad label_ids to match input_ids length
+        # 填充label_ids以匹配input_ids长度
         padded_labels = label_ids + \
             [self.label_map["O"]] * (150 - len(label_ids))
 
@@ -86,11 +86,11 @@ class NERTestDataset(Dataset):
 
         with open(test_file, 'r', encoding='utf-8') as f:
             for line in f:
-                # Remove line number prefix and strip whitespace
-                # Format: "1朝阳区小关北里000-0号" -> "朝阳区小关北里000-0号"
+                # 移除行号前缀并去除空白字符
+                # 格式: "1朝阳区小关北里000-0号" -> "朝阳区小关北里000-0号"
                 text = line.strip()
                 if text:
-                    # Remove the line number at the beginning
+                    # 移除开头的行号
                     text_without_number = ''.join(c for i, c in enumerate(
                         text) if not (i == 0 and c.isdigit()))
                 self.examples.append(text_without_number)
@@ -98,10 +98,10 @@ class NERTestDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         text = self.examples[index]
 
-        # Convert text to character-level tokens for Chinese
+        # 将文本转换为中文的字符级标记
         tokens = list(text)
 
-        # Tokenize the characters
+        # 对字符进行标记化
         encoding = self.tokenizer(
             tokens,
             truncation=True,
@@ -114,8 +114,8 @@ class NERTestDataset(Dataset):
         return {
             "input_ids": encoding["input_ids"].squeeze(0),
             "attention_mask": encoding["attention_mask"].squeeze(0),
-            "text": text,  # Include original text for reference
-            "tokens": tokens  # Include original tokens for mapping predictions back
+            "text": text,  # 包含原始文本以供参考
+            "tokens": tokens  # 包含原始标记以将预测映射回去
         }
 
     def __len__(self):

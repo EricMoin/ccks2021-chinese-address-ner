@@ -5,16 +5,16 @@ def convert_annotated_to_raw(input_path, output_path):
         line = infile.readline()
         while line:
             tokens = []
-            # Read until a blank line or end of file
+            # 读取直到空行或文件结束
             while line.strip() != "":
                 parts = line.strip().split()
                 if len(parts) >= 1:
                     tokens.append(parts[0])
                 line = infile.readline()
-            # Join tokens into one string and write
+            # 将标记连接成一个字符串并写入
             if tokens:
                 outfile.write("".join(tokens) + "\n")
-            # Skip empty lines between entries
+            # 跳过条目之间的空行
             while line.strip() == "":
                 line = infile.readline()
 
