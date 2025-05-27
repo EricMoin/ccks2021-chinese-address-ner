@@ -1,0 +1,71 @@
+# General Settings
+train_file: 'data/train.conll'
+dev_file: 'data/dev.conll'
+test_file: 'data/final_test.txt' # Original test file for submission processing
+output_file: 'result/ensembled_submission.txt' # Final submission output file
+work_dir: 'result' # Base work directory for intermediate files, models, logs
+device: 'cuda' # 'cuda' or 'cpu'
+seed: 2025
+
+# Model & Training Hyperparameters
+model_name: 'pretrained/hfl_chinese-roberta-wwm-ext_adapted_ep2_seed2025' # Default model for training if adaptation is skipped or for a single run
+batch_size: 16
+num_epochs: 15
+learning_rate: 3.0e-5
+weight_decay: 0.01
+freeze_bert_layers: 0
+
+# Loss Function & Regularization
+crf_transition_penalty: 0.175
+focal_loss_alpha: 0.25
+focal_loss_gamma: 2.0
+hybrid_loss_weight_crf: 0.5
+hybrid_loss_weight_focal: 0.5
+spatial_dropout: 0.2
+embedding_dropout: 0.1
+
+# Stochastic Weight Averaging (SWA)
+use_swa: true
+swa_start_epoch: 0
+swa_lr: 1.0e-5
+swa_freq: 2
+
+# Adversarial Training
+# For FreeLB (replaces PGD/FGM)
+use_freelb: true # Set to true to enable FreeLB
+adversarial_training_start_epoch:  3 # Epoch to start FreeLB (0-indexed, so 1 means after the first epoch)
+freelb_adv_lr: 0.05 # Adversarial learning rate
+freelb_adv_steps: 3 # Number of adversarial steps
+freelb_adv_init_mag: 0.05 # Initial perturbation magnitude
+freelb_adv_max_norm: 0.07 # Max norm of the perturbation (0 means use init_mag as constraint)
+freelb_adv_norm_type: 'l2' # Norm type for perturbation ('l2' or 'linf')
+freelb_base_model: 'bert' # Part of the model to apply perturbations ('bert' for BERT embeddings)
+
+# Labeling Schema
+label_map:
+  labels:
+    - 'prov'
+    - 'city'
+    - 'district'
+    - 'devzone'
+    - 'town'
+    - 'community'
+    - 'village_group'
+    - 'road'
+    - 'roadno'
+    - 'poi'
+    - 'subpoi'
+    - 'houseno'
+    - 'cellno'
+    - 'floorno'
+    - 'roomno'
+    - 'detail'
+    - 'assist'
+    - 'distance'
+    - 'intersection'
+    - 'redundant'
+    - 'others'
+  type: 'BIOES'
+
+# K-Fold Cross-Validation
+k_folds: 5

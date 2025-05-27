@@ -1,0 +1,46 @@
+# augment.yaml - Example Configuration for Data Augmentation
+
+# File Paths
+train_file: 'data/train.conll'
+dev_file: 'data/dev.conll'
+work_dir: 'result' # Directory to save augmented files and load models from
+
+# Model and Prediction Settings (for Phase 2 - confidence-based augmentation)
+# Base model name (e.g., from Hugging Face) used for tokenizer and base architecture by Predictor
+# This should be the model your AddressNER model in model.py is based on.
+model_name: 'pretrained/sijunhe_nezha-cn-base_adapted_ep2_seed2025'
+device: 'cuda' # 'cuda' or 'cpu'
+batch_size: 16
+use_swa: true # Whether the Predictor should try to load an SWA (Stochastic Weight Averaging) model if available
+
+# Labeling Scheme (must match the main model's labeling)
+label_map:
+  labels:
+    - 'prov'
+    - 'city'
+    - 'district'
+    - 'devzone'
+    - 'town'
+    - 'community'
+    - 'village_group'
+    - 'road'
+    - 'roadno'
+    - 'poi'
+    - 'subpoi'
+    - 'houseno'
+    - 'cellno'
+    - 'floorno'
+    - 'roomno'
+    - 'detail'
+    - 'assist'
+    - 'distance'
+    - 'intersection'
+    - 'redundant'
+    - 'others'
+  type: 'BIOES' # or 'BIO', depending on your model
+
+# Augmentation Specific Parameters
+augmentation_min_pattern_freq: 2      # Minimum frequency for an entity type pattern to be considered for augmentation
+augmentation_factor: 2                # For each sentence matching a frequent pattern, try to generate this many new sentences
+augmentation_max_sentences: 10000     # Maximum number of new sentences to generate in total for each phase
+augmentation_confidence_threshold: 0.5 # Minimum average confidence for an entity predicted by the model to be included in the new lexicon (Phase 2)

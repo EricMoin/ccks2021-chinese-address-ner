@@ -1,0 +1,18 @@
+model_name: "SpanBERT/spanbert-base-cased"
+discriminator_model_name_or_path: "hfl/chinese-macbert-base"
+generator_model_name_or_path: "hfl/chinese-lert-small"
+
+corpus_file: "data/address.txt"
+seed: 2025
+num_epochs: 2
+batch_size: 16
+max_length: 128
+learning_rate: 2.0e-5
+weight_decay: 0.01
+adam_epsilon: 1.0e-8
+max_grad_norm: 1.0
+warmup_steps: 0
+mask_probability: 0.15
+generator_loss_weight: 1.0
+discriminator_loss_weight: 50.0
+num_workers: 4

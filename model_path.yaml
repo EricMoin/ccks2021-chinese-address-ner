@@ -1,0 +1,8 @@
+available_model_paths:
+- pretrained/hfl_chinese-roberta-wwm-ext_adapted_ep2_seed2025
+- pretrained/hfl_chinese-bert-wwm-ext_adapted_ep2_seed2025
+- pretrained/hfl_chinese-macbert-base_adapted_ep2_seed2025
+- pretrained/hfl_chinese-macbert-large_adapted_ep2_seed2025
+- pretrained/hfl_chinese-roberta-wwm-ext-large_adapted_ep2_seed2025
+- pretrained/hfl_chinese-pert-large_adapted_ep2_seed2025
+- pretrained/hfl_chinese-lert-large_adapted_ep2_seed2025
