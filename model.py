@@ -47,7 +47,7 @@ class AddressNER(nn.Module):
         self.spatial_dropout = SpatialDropout(config.spatial_dropout)
 
         self.lstm = nn.LSTM(
-            input_size=768,  # BERT hidden size
+            input_size=self.bert.config.hidden_size,  # BERT hidden size
             hidden_size=256,
             num_layers=2,
             bidirectional=True,

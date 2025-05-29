@@ -1,4 +1,4 @@
-model_name: "SpanBERT/spanbert-base-cased"
+model_name: "hfl/chinese-macbert-base"
 discriminator_model_name_or_path: "hfl/chinese-macbert-base"
 generator_model_name_or_path: "hfl/chinese-lert-small"
 

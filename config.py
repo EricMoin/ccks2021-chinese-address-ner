@@ -55,6 +55,16 @@ class Config:
     swa_lr: float           # SWA的学习率
     swa_freq: int           # SWA更新频率
 
+    # Span-based和Biaffine相关配置
+    model_type: str          # 模型类型 ('sequence', 'span', 'hybrid')
+    use_biaffine: bool       # 是否使用biaffine attention
+    span_threshold: float    # span预测的置信度阈值
+    sequence_loss_weight: float  # 混合模型中序列标注损失的权重
+    span_loss_weight: float      # 混合模型中span损失的权重
+    biaffine_hidden_dim: int     # biaffine attention的隐藏维度
+    span_dropout: float          # span分类器的dropout率
+    span_loss_type: str          # span损失函数类型
+
     # 其他配置
     seed: int    # 随机种子
     k_folds: int  # K折交叉验证的折数
@@ -116,6 +126,18 @@ class Config:
         self.swa_start_epoch = config_dict.get('swa_start_epoch', 0)
         self.swa_lr = config_dict.get('swa_lr', 1.0e-5)
         self.swa_freq = config_dict.get('swa_freq', 1)
+
+        # 设置Span-based和Biaffine相关配置
+        self.model_type = config_dict.get(
+            'model_type', 'sequence')  # 'sequence', 'span', 'hybrid'
+        self.use_biaffine = config_dict.get('use_biaffine', True)
+        self.span_threshold = config_dict.get('span_threshold', 0.5)
+        self.sequence_loss_weight = config_dict.get(
+            'sequence_loss_weight', 0.5)
+        self.span_loss_weight = config_dict.get('span_loss_weight', 0.5)
+        self.biaffine_hidden_dim = config_dict.get('biaffine_hidden_dim', 512)
+        self.span_dropout = config_dict.get('span_dropout', 0.1)
+        self.span_loss_type = config_dict.get('span_loss_type', 'combined')
 
         # 设置其他配置
         self.seed = config_dict.get('seed', 2024)
@@ -203,3 +225,107 @@ class AdaptationConfig():
         self.discriminator_loss_weight = config_dict.get(
             'discriminator_loss_weight', 50.0)
         self.num_workers = config_dict.get('num_workers', 0)
+
+
+class AugmentConfig(Config):
+    """数据增强配置类，用于处理数据增强相关的配置参数"""
+
+    # 文件路径
+    train_file: str          # 训练数据文件路径
+    dev_file: str           # 验证数据文件路径
+    test_file: str          # 测试数据文件路径（用于可选的伪标签生成）
+    work_dir: str           # 工作目录，用于保存增强文件和加载模型
+
+    # 模型和预测设置（用于第二阶段 - 基于置信度的增强）
+    model_name: str         # 基础模型名称（如来自Hugging Face）
+    device: str             # 训练设备 ('cuda' 或 'cpu')
+    batch_size: int         # 批次大小
+    use_swa: bool          # 是否使用SWA（随机权重平均）模型
+
+    # 标签映射
+    label_map: LabelMap     # 标签映射对象
+
+    # 数据增强特定参数
+    augmentation_min_pattern_freq: int      # 实体类型模式被考虑用于增强的最小频率
+    augmentation_factor: int                # 对于每个匹配频繁模式的句子，尝试生成的新句子数量
+    augmentation_max_sentences: int         # 每个阶段总共生成的新句子的最大数量
+    augmentation_confidence_threshold: float  # 模型预测的实体被包含在新词典中的最小平均置信度（第二阶段）
+
+    # 伪标签策略（第二阶段）
+    use_test_for_pseudo_labeling: bool      # 是否使用测试集进行伪标签生成（默认：False，使用dev集）
+    validate_pseudo_labels: bool           # 当使用dev集时，是否验证伪标签与真实标签的一致性
+
+    def __init__(self, config_path: str):
+        """
+        从YAML配置文件初始化数据增强配置
+
+        Args:
+            config_path: 配置文件路径
+        """
+        # 先调用父类构造函数，获取基础配置
+        super().__init__(config_path)
+
+        # 重新读取配置文件以获取增强特定的参数
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config_dict = yaml.safe_load(f)
+
+        if config_dict is None:
+            raise ValueError(f"YAML file '{config_path}' is empty or invalid.")
+
+        logger.info(f"Loading augmentation config from {config_path}")
+
+        # 设置文件路径
+        self.train_file = config_dict.get('train_file', 'data/train.conll')
+        self.dev_file = config_dict.get('dev_file', 'data/dev.conll')
+        self.test_file = config_dict.get('test_file', 'data/final_test.txt')
+        self.work_dir = config_dict.get('work_dir', 'result')
+
+        # 设置模型和预测设置
+        self.model_name = config_dict.get(
+            'model_name', 'hfl/chinese-roberta-wwm-ext')
+        self.device = config_dict.get(
+            'device', 'cuda' if torch.cuda.is_available() else 'cpu')
+        self.batch_size = config_dict.get('batch_size', 16)
+        self.use_swa = config_dict.get('use_swa', True)
+
+        # 设置数据增强特定参数
+        self.augmentation_min_pattern_freq = config_dict.get(
+            'augmentation_min_pattern_freq', 2)
+        self.augmentation_factor = config_dict.get('augmentation_factor', 2)
+        self.augmentation_max_sentences = config_dict.get(
+            'augmentation_max_sentences', 10000)
+        self.augmentation_confidence_threshold = config_dict.get(
+            'augmentation_confidence_threshold', 0.5)
+
+        # 设置伪标签策略
+        self.use_test_for_pseudo_labeling = config_dict.get(
+            'use_test_for_pseudo_labeling', False)
+        self.validate_pseudo_labels = config_dict.get(
+            'validate_pseudo_labels', True)
+
+        # 处理标签映射
+        label_map_dict = config_dict.get('label_map', {})
+        if not label_map_dict:
+            raise ValueError(
+                "label_map configuration is missing in the YAML file")
+
+        self.label_map = LabelMap(
+            labels=label_map_dict.get('labels', []),
+            type=label_map_dict.get('type', 'BIOES')
+        )
+
+        logger.info(f"Augmentation config loaded successfully:")
+        logger.info(f"  - Model: {self.model_name}")
+        logger.info(f"  - Device: {self.device}")
+        logger.info(
+            f"  - Min pattern frequency: {self.augmentation_min_pattern_freq}")
+        logger.info(f"  - Augmentation factor: {self.augmentation_factor}")
+        logger.info(f"  - Max sentences: {self.augmentation_max_sentences}")
+        logger.info(
+            f"  - Confidence threshold: {self.augmentation_confidence_threshold}")
+        logger.info(
+            f"  - Use test for pseudo-labeling: {self.use_test_for_pseudo_labeling}")
+        logger.info(
+            f"  - Validate pseudo-labels: {self.validate_pseudo_labels}")
+        logger.info(f"  - Label scheme: {self.label_map.type}")
+        logger.info(f"  - Number of labels: {len(self.label_map.labels)}")

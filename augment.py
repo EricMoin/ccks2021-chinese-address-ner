@@ -116,6 +116,50 @@ def generate_bioes_labels(tokens: list[str], entity_type: str) -> list[str]:
     return labels
 
 
+def validate_bioes_sequence(labels: list[str]) -> tuple[bool, str]:
+    """
+    验证BIOES标签序列是否符合规范
+    返回: (是否有效, 错误信息)
+    """
+    if not labels:
+        return True, ""
+
+    prev_bio = None
+    prev_type = None
+
+    for i, label in enumerate(labels):
+        if label == 'O':
+            prev_bio = 'O'
+            prev_type = None
+            continue
+
+        if '-' not in label:
+            return False, f"位置 {i}: 标签格式错误 '{label}'"
+
+        bio_prefix, entity_type = label.split('-', 1)
+
+        if bio_prefix == 'B':
+            prev_bio = 'B'
+            prev_type = entity_type
+        elif bio_prefix == 'I':
+            if prev_bio not in ['B', 'I'] or prev_type != entity_type:
+                return False, f"位置 {i}: 孤立的I标签 '{label}', 前一个: '{labels[i-1] if i > 0 else 'None'}'"
+            prev_bio = 'I'
+            prev_type = entity_type
+        elif bio_prefix == 'E':
+            if prev_bio not in ['B', 'I'] or prev_type != entity_type:
+                return False, f"位置 {i}: 孤立的E标签 '{label}', 前一个: '{labels[i-1] if i > 0 else 'None'}'"
+            prev_bio = 'E'
+            prev_type = None
+        elif bio_prefix == 'S':
+            prev_bio = 'S'
+            prev_type = None
+        else:
+            return False, f"位置 {i}: 未知的BIO前缀 '{bio_prefix}'"
+
+    return True, ""
+
+
 def augment_data_by_replacement(
     original_conll_file: str,
     frequent_patterns: collections.Counter[tuple[str, ...]],
@@ -169,69 +213,136 @@ def augment_data_by_replacement(
 
             new_tokens: list[str] = []
             new_labels: list[str] = []
-
-            idx = 0
             made_a_replacement = False
-            while idx < len(original_tokens):
-                original_token = original_tokens[idx]
-                original_label = original_labels[idx]
-                current_entity_type = get_entity_type_from_label(
-                    original_label)
-                bio_prefix = original_label.split(
-                    '-', 1)[0] if '-' in original_label else 'O'
 
-                if bio_prefix in ['B', 'S'] and current_entity_type != 'O':
-                    # This is the start of an entity
-                    entity_tokens_original = [original_token]
-                    entity_labels_original = [original_label]
-                    temp_idx = idx + 1
-                    if bio_prefix == 'B':
-                        while temp_idx < len(original_tokens) and get_entity_type_from_label(original_labels[temp_idx]) == current_entity_type and original_labels[temp_idx].startswith(('I-', 'E-')):
-                            entity_tokens_original.append(
-                                original_tokens[temp_idx])
-                            entity_labels_original.append(
-                                original_labels[temp_idx])
-                            if original_labels[temp_idx].startswith('E-'):
+            # 重新实现：先正确解析所有实体，然后逐个处理
+            # [(start_idx, end_idx, tokens, labels, entity_type)]
+            entities = []
+
+            # 第一步：正确识别所有实体边界
+            i = 0
+            while i < len(original_tokens):
+                token = original_tokens[i]
+                label = original_labels[i]
+                entity_type = get_entity_type_from_label(label)
+                bio_prefix = label.split('-', 1)[0] if '-' in label else 'O'
+
+                if bio_prefix == 'B':
+                    # 开始一个新实体
+                    start_idx = i
+                    entity_tokens = [token]
+                    entity_labels = [label]
+                    i += 1
+
+                    # 继续收集这个实体的其余部分
+                    while i < len(original_tokens):
+                        next_token = original_tokens[i]
+                        next_label = original_labels[i]
+                        next_entity_type = get_entity_type_from_label(
+                            next_label)
+                        next_bio_prefix = next_label.split(
+                            '-', 1)[0] if '-' in next_label else 'O'
+
+                        # 如果是同一实体的I或E标签
+                        if next_entity_type == entity_type and next_bio_prefix in ['I', 'E']:
+                            entity_tokens.append(next_token)
+                            entity_labels.append(next_label)
+                            # 如果是E标签，实体结束
+                            if next_bio_prefix == 'E':
+                                end_idx = i  # E标签的位置就是结束位置
+                                i += 1  # 移动到下一个位置
                                 break
-                            temp_idx += 1
-
-                    # Try to replace this entity
-                    if current_entity_type in available_entities and available_entities[current_entity_type]:
-                        # Filter out the original entity itself to avoid replacing with the same
-                        possible_replacements = [
-                            e for e in available_entities[current_entity_type] if e != entity_tokens_original]
-                        if possible_replacements:
-                            replacement_entity_tokens = random.choice(
-                                possible_replacements)
-                            replacement_entity_labels = generate_bioes_labels(
-                                replacement_entity_tokens, current_entity_type)
-
-                            new_tokens.extend(replacement_entity_tokens)
-                            new_labels.extend(replacement_entity_labels)
-                            idx = temp_idx  # Move main index past the original entity
-                            made_a_replacement = True
-                            continue  # continue while loop
+                            i += 1
                         else:
-                            # No other replacements available, use original
-                            new_tokens.extend(entity_tokens_original)
-                            new_labels.extend(entity_labels_original)
-                            idx = temp_idx
-                            continue
+                            # 不是同一实体，当前实体结束（没有显式E标签）
+                            end_idx = i - 1  # 前一个位置是实体的结束位置
+                            break
                     else:
-                        # No entities of this type available for replacement, use original
-                        new_tokens.extend(entity_tokens_original)
-                        new_labels.extend(entity_labels_original)
-                        idx = temp_idx
-                        continue
-                else:  # O tag or I/E tag (which are handled by B/S block)
-                    new_tokens.append(original_token)
-                    new_labels.append(original_label)
-                    idx += 1
+                        # while循环正常结束，实体在句子末尾结束
+                        end_idx = i - 1
 
-            # Ensure consistency
+                    entities.append(
+                        (start_idx, end_idx, entity_tokens, entity_labels, entity_type))
+
+                elif bio_prefix == 'S':
+                    # 单字符实体
+                    entities.append((i, i, [token], [label], entity_type))
+                    i += 1
+                else:
+                    # O标签或其他，跳过
+                    i += 1
+
+            # 第二步：处理每个token，如果是实体则尝试替换
+            processed_until = 0
+
+            for start_idx, end_idx, entity_tokens, entity_labels, entity_type in entities:
+                # 添加实体之前的非实体token
+                while processed_until < start_idx:
+                    new_tokens.append(original_tokens[processed_until])
+                    new_labels.append(original_labels[processed_until])
+                    processed_until += 1
+
+                # 尝试替换当前实体
+                if entity_type in available_entities and available_entities[entity_type]:
+                    possible_replacements = [
+                        e for e in available_entities[entity_type] if e != entity_tokens]
+                    if possible_replacements:
+                        replacement_entity_tokens = random.choice(
+                            possible_replacements)
+                        replacement_entity_labels = generate_bioes_labels(
+                            replacement_entity_tokens, entity_type)
+
+                        new_tokens.extend(replacement_entity_tokens)
+                        new_labels.extend(replacement_entity_labels)
+                        made_a_replacement = True
+                    else:
+                        # 没有可替换的实体，保持原样
+                        new_tokens.extend(entity_tokens)
+                        # MODIFICATION START: Regenerate labels for consistency even if not replaced
+                        # Original line: new_labels.extend(entity_labels)
+                        refreshed_entity_labels = generate_bioes_labels(
+                            entity_tokens, entity_type)
+                        new_labels.extend(refreshed_entity_labels)
+                        # If refreshing labels changed them, it's a modification.
+                        # This ensures that if original entity_labels were subtly incorrect (e.g. E for single token)
+                        # they get corrected to proper S-tag etc.
+                        if tuple(refreshed_entity_labels) != tuple(entity_labels):
+                            made_a_replacement = True  # Treat as a replacement for validation logic
+                        # MODIFICATION END
+                else:
+                    # 没有该类型的实体，保持原样
+                    new_tokens.extend(entity_tokens)
+                    # MODIFICATION START: Regenerate labels for consistency here as well
+                    # Original line: new_labels.extend(entity_labels)
+                    refreshed_entity_labels = generate_bioes_labels(
+                        entity_tokens, entity_type)
+                    new_labels.extend(refreshed_entity_labels)
+                    if tuple(refreshed_entity_labels) != tuple(entity_labels):
+                        made_a_replacement = True
+                    # MODIFICATION END
+
+                processed_until = end_idx + 1
+
+            # 添加剩余的非实体token
+            while processed_until < len(original_tokens):
+                new_tokens.append(original_tokens[processed_until])
+                new_labels.append(original_labels[processed_until])
+                processed_until += 1
+
+            # Ensure consistency and validate BIOES sequence
             if made_a_replacement and len(new_tokens) == len(new_labels):
-                augmented_sentences.append(ConllEntity(
-                    tokens=new_tokens, labels=new_labels))
+                # 验证生成的标签序列
+                is_valid, error_msg = validate_bioes_sequence(new_labels)
+                if is_valid:
+                    augmented_sentences.append(ConllEntity(
+                        tokens=new_tokens, labels=new_labels))
+                else:
+                    print(f"Warning: Invalid BIOES sequence detected and skipped.")
+                    print(f"  Tokens: {''.join(new_tokens)}")
+                    print(f"  Labels: {new_labels}")
+                    print(f"  Error: {error_msg}")
+                    print(
+                        f"  Original: {''.join(original_tokens)} -> {original_labels}")
 
     print(
         f"Processed {original_sentences_processed} original sentences matching frequent patterns.")
@@ -270,15 +381,68 @@ def extract_high_confidence_entities_from_predictions(
         print("Warning: Mismatch in lengths of input lists for confidence extraction. Skipping.")
         return high_confidence_entities
 
+    # 添加调试信息
+    print(f"Debug: Processing {len(sentences_tokens)} sentences")
+    print(f"Debug: Confidence threshold: {confidence_threshold}")
+    print(f"Debug: Label map has {len(label_map_instance.label2id)} labels")
+
+    # 统计预测标签分布
+    all_predicted_labels = []
+    for labels in predicted_labels_sequences:
+        all_predicted_labels.extend(labels)
+
+    label_counts = collections.Counter(all_predicted_labels)
+    print(f"Debug: Top 10 predicted labels: {label_counts.most_common(10)}")
+
+    # 检查非O标签的数量
+    non_o_labels = [label for label in all_predicted_labels if label != 'O']
+    print(
+        f"Debug: Total non-O labels: {len(non_o_labels)} out of {len(all_predicted_labels)}")
+
+    if len(non_o_labels) == 0:
+        print("Debug: No non-O labels found in predictions! All predictions are 'O'.")
+        return high_confidence_entities
+
+    # 检查标签映射
+    sample_labels = list(set(all_predicted_labels))[:10]
+    print(f"Debug: Sample label mappings:")
+    for label in sample_labels:
+        label_id = label_map_instance.label2id.get(label, -1)
+        print(f"  {label} -> {label_id}")
+
+    entities_found = 0
+    high_conf_entities_found = 0
+
+    # 添加长度统计调试信息
+    length_mismatches = 0
+    processed_sentences = 0
+
     for sent_idx, tokens in enumerate(sentences_tokens):
         labels = predicted_labels_sequences[sent_idx]
         logits = logits_tensors[sent_idx]
 
-        if len(tokens) != len(labels) or len(tokens) != logits.shape[0]:
-            # print(f"Warning: Mismatch in lengths for sentence {sent_idx}. Tokens: {len(tokens)}, Labels: {len(labels)}, Logits: {logits.shape[0]}. Skipping sentence.")
+        if len(tokens) != len(labels):
+            print(
+                f"Warning: Mismatch in lengths for sentence {sent_idx}. Tokens: {len(tokens)}, Labels: {len(labels)}. Skipping sentence.")
             continue
 
-        probabilities = torch.softmax(logits, dim=-1)
+        # 修复：处理logits长度与实际序列长度不匹配的问题
+        actual_seq_len = len(tokens)
+        if logits.shape[0] < actual_seq_len:
+            print(
+                f"Warning: Logits too short for sentence {sent_idx}. Logits: {logits.shape[0]}, Tokens: {actual_seq_len}. Skipping sentence.")
+            length_mismatches += 1
+            continue
+
+        # 只使用实际序列长度的logits
+        logits_actual = logits[:actual_seq_len, :]
+        probabilities = torch.softmax(logits_actual, dim=-1)
+        processed_sentences += 1
+
+        # 调试：打印前几个句子的长度信息
+        if sent_idx < 5:
+            print(
+                f"Debug: Sentence {sent_idx} - Tokens: {len(tokens)}, Labels: {len(labels)}, Logits: {logits.shape[0]} -> {actual_seq_len}")
 
         current_entity_tokens: list[str] = []
         current_entity_type: str | None = None
@@ -289,74 +453,162 @@ def extract_high_confidence_entities_from_predictions(
             entity_type = get_entity_type_from_label(label)
             bio_prefix = label.split('-', 1)[0] if '-' in label else 'O'
 
-            token_prob = probabilities[token_idx, label_map_instance.label2id.get(
-                label, -1)].item() if label_map_instance.label2id.get(label, -1) != -1 else 0.0
+            # 获取标签ID和置信度
+            label_id = label_map_instance.label2id.get(label, -1)
+            if label_id == -1:
+                token_prob = 0.0
+                if sent_idx < 3:  # 只在前几个句子中打印调试信息
+                    print(
+                        f"Debug: Unknown label '{label}' at sentence {sent_idx}, token {token_idx}")
+            else:
+                token_prob = probabilities[token_idx, label_id].item()
+
+            # 调试：打印前几个非O标签的置信度
+            if bio_prefix != 'O' and sent_idx < 3:
+                print(
+                    f"Debug: Sentence {sent_idx}, Token '{token_str}', Label '{label}', Confidence: {token_prob:.4f}")
 
             if bio_prefix == 'B':
-                if current_entity_tokens and current_entity_type:  # Save previous if any
+                # 保存之前的实体（如果有）
+                if current_entity_tokens and current_entity_type:
                     avg_prob = sum(
                         current_entity_probs) / len(current_entity_probs) if current_entity_probs else 0
-                    # Corrected usage for the entity being closed out
+                    entities_found += 1
                     previous_entity_text_tuple = tuple(current_entity_tokens)
                     if avg_prob >= confidence_threshold and previous_entity_text_tuple not in processed_entity_texts_for_type[current_entity_type]:
                         high_confidence_entities[current_entity_type].append(
                             list(current_entity_tokens))
                         processed_entity_texts_for_type[current_entity_type].add(
                             previous_entity_text_tuple)
+                        high_conf_entities_found += 1
+                        print(
+                            f"Debug: Found high-conf entity: {''.join(current_entity_tokens)} ({current_entity_type}) with confidence {avg_prob:.4f}")
 
+                # 开始新实体
                 current_entity_tokens = [token_str]
                 current_entity_type = entity_type
                 current_entity_probs = [token_prob]
             elif bio_prefix == 'S':
-                if current_entity_tokens and current_entity_type:  # Save previous if any
+                # 保存之前的实体（如果有）
+                if current_entity_tokens and current_entity_type:
                     avg_prob = sum(
                         current_entity_probs) / len(current_entity_probs) if current_entity_probs else 0
-                    # Corrected usage for the entity being closed out
+                    entities_found += 1
                     previous_entity_text_tuple = tuple(current_entity_tokens)
                     if avg_prob >= confidence_threshold and previous_entity_text_tuple not in processed_entity_texts_for_type[current_entity_type]:
                         high_confidence_entities[current_entity_type].append(
                             list(current_entity_tokens))
                         processed_entity_texts_for_type[current_entity_type].add(
                             previous_entity_text_tuple)
+                        high_conf_entities_found += 1
+                        print(
+                            f"Debug: Found high-conf entity: {''.join(current_entity_tokens)} ({current_entity_type}) with confidence {avg_prob:.4f}")
 
-                # Process S tag as a new, complete entity
+                # 处理单字符实体
+                entities_found += 1
                 single_token_entity_tuple = tuple([token_str])
                 if token_prob >= confidence_threshold and single_token_entity_tuple not in processed_entity_texts_for_type[entity_type]:
                     high_confidence_entities[entity_type].append([token_str])
                     processed_entity_texts_for_type[entity_type].add(
                         single_token_entity_tuple)
+                    high_conf_entities_found += 1
+                    print(
+                        f"Debug: Found high-conf S entity: {token_str} ({entity_type}) with confidence {token_prob:.4f}")
                 current_entity_tokens = []
                 current_entity_type = None
                 current_entity_probs = []
-            elif bio_prefix in ['I', 'E'] and current_entity_type == entity_type:
-                current_entity_tokens.append(token_str)
-                current_entity_probs.append(token_prob)
-                if bio_prefix == 'E':
+            elif bio_prefix in ['I', 'E']:
+                # 修复：更保守地处理I-和E-标签
+                if current_entity_type == entity_type:
+                    # 继续当前实体（正常情况）
+                    current_entity_tokens.append(token_str)
+                    current_entity_probs.append(token_prob)
+                    if bio_prefix == 'E':
+                        # 结束当前实体
+                        if current_entity_tokens and current_entity_type:
+                            avg_prob = sum(
+                                current_entity_probs) / len(current_entity_probs) if current_entity_probs else 0
+                            entities_found += 1
+                            current_entity_text_tuple = tuple(
+                                current_entity_tokens)
+                            if avg_prob >= confidence_threshold and current_entity_text_tuple not in processed_entity_texts_for_type[current_entity_type]:
+                                high_confidence_entities[current_entity_type].append(
+                                    list(current_entity_tokens))
+                                processed_entity_texts_for_type[current_entity_type].add(
+                                    current_entity_text_tuple)
+                                high_conf_entities_found += 1
+                                print(
+                                    f"Debug: Found high-conf E entity: {''.join(current_entity_tokens)} ({current_entity_type}) with confidence {avg_prob:.4f}")
+                        current_entity_tokens = []
+                        current_entity_type = None
+                        current_entity_probs = []
+                elif current_entity_type is None and bio_prefix == 'I':
+                    # 孤立的I-标签：更保守的处理策略
+                    # 检查是否在句子开头（可能是跨句子的实体片段）
+                    if token_idx == 0:
+                        # 句子开头的孤立I-标签，很可能是实体被分割，跳过
+                        print(
+                            f"Debug: Skipping orphaned I- tag at sentence start {sent_idx}, token {token_idx}: {label}")
+                        continue
+                    else:
+                        # 句子中间的孤立I-标签，可能是标注错误，也跳过
+                        print(
+                            f"Debug: Skipping orphaned I- tag in middle {sent_idx}, token {token_idx}: {label}")
+                        continue
+                else:
+                    # 实体类型不匹配或其他情况
                     if current_entity_tokens and current_entity_type:
+                        # 结束之前的实体
                         avg_prob = sum(
                             current_entity_probs) / len(current_entity_probs) if current_entity_probs else 0
-                        # Corrected usage for the entity being closed out by E
-                        current_entity_text_tuple = tuple(
+                        entities_found += 1
+                        previous_entity_text_tuple = tuple(
                             current_entity_tokens)
-                        if avg_prob >= confidence_threshold and current_entity_text_tuple not in processed_entity_texts_for_type[current_entity_type]:
+                        if avg_prob >= confidence_threshold and previous_entity_text_tuple not in processed_entity_texts_for_type[current_entity_type]:
                             high_confidence_entities[current_entity_type].append(
                                 list(current_entity_tokens))
                             processed_entity_texts_for_type[current_entity_type].add(
-                                current_entity_text_tuple)
+                                previous_entity_text_tuple)
+                            high_conf_entities_found += 1
+                            print(
+                                f"Debug: Found high-conf implicit entity: {''.join(current_entity_tokens)} ({current_entity_type}) with confidence {avg_prob:.4f}")
+
+                    # 对于孤立的E-标签，检查是否应该作为单字符实体
+                    if bio_prefix == 'E':
+                        # 只有当它不是句子开头且置信度足够高时，才考虑作为单字符实体
+                        if token_idx > 0 and token_prob >= confidence_threshold:
+                            entities_found += 1
+                            single_token_entity_tuple = tuple([token_str])
+                            if single_token_entity_tuple not in processed_entity_texts_for_type[entity_type]:
+                                high_confidence_entities[entity_type].append(
+                                    [token_str])
+                                processed_entity_texts_for_type[entity_type].add(
+                                    single_token_entity_tuple)
+                                high_conf_entities_found += 1
+                                print(
+                                    f"Debug: Found high-conf orphaned E entity: {token_str} ({entity_type}) with confidence {token_prob:.4f}")
+                        else:
+                            print(
+                                f"Debug: Skipping suspicious orphaned E- tag at sentence {sent_idx}, token {token_idx}: {label}")
+
+                    # 重置状态，不开始新实体
                     current_entity_tokens = []
                     current_entity_type = None
                     current_entity_probs = []
-            else:  # O tag or end of an entity without E (implicit end)
+            else:  # O tag
                 if current_entity_tokens and current_entity_type:
                     avg_prob = sum(
                         current_entity_probs) / len(current_entity_probs) if current_entity_probs else 0
-                    # Corrected usage for the entity being implicitly closed out
+                    entities_found += 1
                     previous_entity_text_tuple = tuple(current_entity_tokens)
                     if avg_prob >= confidence_threshold and previous_entity_text_tuple not in processed_entity_texts_for_type[current_entity_type]:
                         high_confidence_entities[current_entity_type].append(
                             list(current_entity_tokens))
                         processed_entity_texts_for_type[current_entity_type].add(
                             previous_entity_text_tuple)
+                        high_conf_entities_found += 1
+                        print(
+                            f"Debug: Found high-conf implicit entity: {''.join(current_entity_tokens)} ({current_entity_type}) with confidence {avg_prob:.4f}")
                 current_entity_tokens = []
                 current_entity_type = None
                 current_entity_probs = []
@@ -365,13 +617,22 @@ def extract_high_confidence_entities_from_predictions(
         if current_entity_tokens and current_entity_type:
             avg_prob = sum(current_entity_probs) / \
                 len(current_entity_probs) if current_entity_probs else 0
-            # Corrected usage for trailing entity
+            entities_found += 1
             trailing_entity_text_tuple = tuple(current_entity_tokens)
             if avg_prob >= confidence_threshold and trailing_entity_text_tuple not in processed_entity_texts_for_type[current_entity_type]:
                 high_confidence_entities[current_entity_type].append(
                     list(current_entity_tokens))
                 processed_entity_texts_for_type[current_entity_type].add(
                     trailing_entity_text_tuple)
+                high_conf_entities_found += 1
+                print(
+                    f"Debug: Found high-conf trailing entity: {''.join(current_entity_tokens)} ({current_entity_type}) with confidence {avg_prob:.4f}")
+
+    print(f"Debug: Total entities found: {entities_found}")
+    print(f"Debug: High-confidence entities found: {high_conf_entities_found}")
+    print(
+        f"Debug: Processed sentences: {processed_sentences}/{len(sentences_tokens)}")
+    print(f"Debug: Length mismatches: {length_mismatches}")
 
     return high_confidence_entities
 
@@ -381,8 +642,8 @@ if __name__ == "__main__":
     app_config = AugmentConfig("augment.yaml")
 
     train_file = app_config.train_file
-    dev_file = app_config.dev_file  # Assuming dev_file is in config
-    label_map_instance = app_config.label_map  # Get LabelMap from AppConfig
+    dev_file = app_config.dev_file
+    label_map_instance = app_config.label_map
 
     # --- First phase: Augment using ground truth from train_file ---
     print("--- Phase 1: Augmentation based on ground truth entities ---")
@@ -417,93 +678,128 @@ if __name__ == "__main__":
     # --- Second phase: Augment using high-confidence entities from model predictions ---
     print("\n--- Phase 2: Augmentation based on high-confidence predicted entities ---")
 
+    # 数据源选择策略：
+    # 1. 优先使用dev集（安全，有ground truth验证）
+    # 2. 可选使用测试集（更多数据，但需要谨慎）
+    # 3. 理想情况：使用外部无标签数据
+
+    # 从配置文件读取伪标签策略
+    use_test_for_pseudo_labeling = app_config.use_test_for_pseudo_labeling
+    pseudo_label_source = "test_file" if use_test_for_pseudo_labeling else "dev_file"
+
+    if use_test_for_pseudo_labeling:
+        print("⚠️  WARNING: Using test set for pseudo-labeling!")
+        print("   This may lead to data leakage and overly optimistic evaluation.")
+        print("   Consider using external unlabeled data instead.")
+        pseudo_file = app_config.test_file
+        print(f"   Using test file: {pseudo_file}")
+    else:
+        print("✅ Using dev set for pseudo-labeling (recommended for safety)")
+        pseudo_file = dev_file
+        print(f"   Using dev file: {pseudo_file}")
+
     # Initialize Predictor
-    # The model_init_config for predictor should point to the base BERT model, not a trained checkpoint initially.
-    # The actual trained model path is given to get_predictions_for_fold.
-    # We need a config object that has .device, .label_map, and .model_name (for tokenizer in AddressNER)
-    # Let's reuse app_config for simplicity, assuming its model_name is the base for tokenizer.
-    # predictor_config = AppConfig(config_data) # Or a specific one if needed
     predictor = Predictor(model_init_config=app_config)
 
-    # Define path to the trained model (e.g., from a specific fold or a single run)
-    # This path needs to be correctly set based on your training output structure.
-    # For example, if a single train run saves to config.work_dir/best_model.pt
-    # Adjust if your models are in subdirs like fold_0, etc.
+    # Define path to the trained model
     trained_model_fold_dir = os.path.join(
         app_config.work_dir, app_config.model_name)
-    # If you have k-folds, you might loop here or pick one fold's model.
-    # For this example, assuming a single model path structure like `work_dir/best_model.pt` or `work_dir/swa_model.pt`
 
     print(
-        f"Loading dev data ({dev_file}) for prediction to get high-confidence entities...")
-    # The Predictor.get_predictions_for_fold expects a raw text file path if its internal loader is used.
-    # If dev_file is CoNLL, we need to either convert it or ensure NERDataset handles it.
-    # NERDataset in predictor.py is initialized with conll_examples. Let's assume dev_file can be used.
-    # We also need the original tokens from dev_file to pass to extract_high_confidence_entities.
+        f"Loading data from {pseudo_file} for prediction to get high-confidence entities...")
 
-    dev_conll_reader = ConllReader()
-    dev_sentences_conll = list(dev_conll_reader.read(dev_file))
-    dev_sentences_tokens = [entity.tokens for entity in dev_sentences_conll]
+    # 根据数据源类型选择不同的处理方式
+    if use_test_for_pseudo_labeling:
+        # 对于测试集，需要特殊处理（假设是原始文本格式）
+        print("Processing test file format...")
+        # 这里需要根据实际的测试文件格式进行调整
+        # 假设测试文件格式为: guid\u0001text
+        test_sentences_char_tokens = []
+        if os.path.exists(pseudo_file):
+            with open(pseudo_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            text_part = line.split('\u0001')[1]
+                            test_sentences_char_tokens.append(list(text_part))
+                        except IndexError:
+                            print(f"Warning: Skipping malformed line: {line}")
+                            test_sentences_char_tokens.append([])
+
+        # 创建伪ConLL实体（没有真实标签）
+        pseudo_conll_examples = [ConllEntity(chars, ['O'] * len(chars))
+                                 for chars in test_sentences_char_tokens]
+        pseudo_sentences_tokens = test_sentences_char_tokens
+    else:
+        # 对于dev集，使用ConLL格式
+        print("Processing CoNLL format...")
+        dev_conll_reader = ConllReader()
+        pseudo_conll_examples = list(dev_conll_reader.read(pseudo_file))
+        pseudo_sentences_tokens = [
+            entity.tokens for entity in pseudo_conll_examples]
 
     print(
-        f"Predicting on {dev_file} using model from {trained_model_fold_dir}...")
-    # Assuming use_swa_if_available is true if swa is generally used.
+        f"Predicting on {pseudo_file} using model from {trained_model_fold_dir}...")
     use_swa = app_config.use_swa
 
-    predicted_labels_dev, logits_dev = predictor.get_predictions_for_fold(
+    predicted_labels_pseudo, logits_pseudo = predictor.get_predictions_for_conll_data(
         fold_work_dir=trained_model_fold_dir,
-        test_conll_examples=dev_sentences_conll,
+        test_conll_examples=pseudo_conll_examples,
         label_map=label_map_instance,
         batch_size=app_config.batch_size,
         use_swa_if_available=use_swa
     )
 
-    if not predicted_labels_dev:
-        print(
-            "No predictions obtained from dev set. Skipping confidence-based augmentation.")
+    if not predicted_labels_pseudo:
+        print("No predictions obtained from pseudo-labeling source. Skipping confidence-based augmentation.")
     else:
-        print(f"Extracting high-confidence entities from dev set predictions...")
-        # Ensure sentences_tokens align with predictions. `dev_sentences_tokens` from ConllReader should align if predictor processes dev.conll sequentially.
-        # Check length alignment before proceeding
-        if len(dev_sentences_tokens) != len(predicted_labels_dev):
+        print(f"Extracting high-confidence entities from predictions...")
+
+        # 验证数据对齐
+        if len(pseudo_sentences_tokens) != len(predicted_labels_pseudo):
             print(
-                f"Mismatch between CoNLL read dev sentences ({len(dev_sentences_tokens)}) and predicted sentences ({len(predicted_labels_dev)}). CANNOT PROCEED WITH CONFIDENCE EXTRACTION.")
+                f"Mismatch between source sentences ({len(pseudo_sentences_tokens)}) and predicted sentences ({len(predicted_labels_pseudo)}). CANNOT PROCEED WITH CONFIDENCE EXTRACTION.")
         else:
-            # e.g., 0.9, add to config
             confidence_threshold = app_config.augmentation_confidence_threshold
             entities_by_type_conf = extract_high_confidence_entities_from_predictions(
-                sentences_tokens=dev_sentences_tokens,
-                predicted_labels_sequences=predicted_labels_dev,
-                logits_tensors=logits_dev,
+                sentences_tokens=pseudo_sentences_tokens,
+                predicted_labels_sequences=predicted_labels_pseudo,
+                logits_tensors=logits_pseudo,
                 label_map_instance=label_map_instance,
                 confidence_threshold=confidence_threshold
             )
+
             print(
-                f"Found {sum(len(v) for v in entities_by_type_conf.values())} high-confidence entities from dev set predictions.")
+                f"Found {sum(len(v) for v in entities_by_type_conf.values())} high-confidence entities from {pseudo_label_source} predictions.")
+
+            # 如果使用dev集，可以进行质量验证
+            if not use_test_for_pseudo_labeling and hasattr(app_config, 'validate_pseudo_labels') and app_config.validate_pseudo_labels:
+                print("Validating pseudo-labels against ground truth...")
+                # 这里可以添加验证逻辑，比较预测标签与真实标签的一致性
+
             for ent_type, ent_list in entities_by_type_conf.items():
                 if ent_list:
                     print(
                         f"  Type: {ent_type}, Num high-conf entities: {len(ent_list)}, Example: {''.join(random.choice(ent_list))}")
 
-            # Augment using the new high-confidence lexicon
-            # We can choose to augment the original train_file or the already augmented train_augmented_gt.conll
-            # Let's use original train_file for this example, and its patterns.
+            # 使用高置信度实体进行数据增强
             if sum(len(v) for v in entities_by_type_conf.values()) > 0:
                 print(
                     "Starting data augmentation by replacement (using high-confidence entities)...")
                 augmented_data_conf = augment_data_by_replacement(
-                    original_conll_file=train_file,  # Or use augmented_data_gt as a base
-                    # Or re-calculate patterns if augmenting a different base
+                    original_conll_file=train_file,
                     frequent_patterns=frequent_patterns_gt,
                     entities_by_type=entities_by_type_conf,
                     label_map_instance=label_map_instance,
-                    augmentation_factor=app_config.augmentation_factor,  # Could be a different factor
-                    max_new_sentences=app_config.augmentation_max_sentences  # Could be a different max
+                    augmentation_factor=app_config.augmentation_factor,
+                    max_new_sentences=app_config.augmentation_max_sentences
                 )
                 print(
                     f"Generated {len(augmented_data_conf)} new sentences using high-confidence entities.")
 
-                augmented_output_file_conf = app_config.work_dir + "/train_augmented_conf.conll"
+                suffix = "test" if use_test_for_pseudo_labeling else "dev"
+                augmented_output_file_conf = f"{app_config.work_dir}/train_augmented_conf_{suffix}.conll"
                 if augmented_data_conf:
                     write_conll_file(augmented_data_conf,
                                      augmented_output_file_conf)

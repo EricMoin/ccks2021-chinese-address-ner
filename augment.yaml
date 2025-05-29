@@ -3,6 +3,7 @@
 # File Paths
 train_file: 'data/train.conll'
 dev_file: 'data/dev.conll'
+test_file: 'data/final_test.txt'  # Added test file path for optional pseudo-labeling
 work_dir: 'result' # Directory to save augmented files and load models from
 
 # Model and Prediction Settings (for Phase 2 - confidence-based augmentation)
@@ -10,8 +11,31 @@ work_dir: 'result' # Directory to save augmented files and load models from
 # This should be the model your AddressNER model in model.py is based on.
 model_name: 'pretrained/sijunhe_nezha-cn-base_adapted_ep2_seed2025'
 device: 'cuda' # 'cuda' or 'cpu'
-batch_size: 16
 use_swa: true # Whether the Predictor should try to load an SWA (Stochastic Weight Averaging) model if available
+
+batch_size: 16
+num_epochs: 15
+learning_rate: 3.0e-5
+weight_decay: 0.01
+freeze_bert_layers: 0
+
+crf_transition_penalty: 0.175
+focal_loss_alpha: 0.25
+focal_loss_gamma: 2.0
+hybrid_loss_weight_crf: 0.5
+hybrid_loss_weight_focal: 0.5
+spatial_dropout: 0.2
+embedding_dropout: 0.1
+
+use_freelb: true
+adversarial_training_start_epoch: 3
+freelb_adv_lr: 0.05
+freelb_adv_steps: 3
+freelb_adv_init_mag: 0.05
+freelb_adv_max_norm: 0.07
+freelb_adv_norm_type: 'l2'
+freelb_base_model: 'bert'
+
 
 # Labeling Scheme (must match the main model's labeling)
 label_map:
@@ -44,3 +68,7 @@ augmentation_min_pattern_freq: 2      # Minimum frequency for an entity type pat
 augmentation_factor: 2                # For each sentence matching a frequent pattern, try to generate this many new sentences
 augmentation_max_sentences: 10000     # Maximum number of new sentences to generate in total for each phase
 augmentation_confidence_threshold: 0.5 # Minimum average confidence for an entity predicted by the model to be included in the new lexicon (Phase 2)
+
+# Pseudo-labeling Strategy (Phase 2)
+use_test_for_pseudo_labeling: false   # Whether to use test set for pseudo-labeling (default: false, use dev set)
+validate_pseudo_labels: true          # Whether to validate pseudo-labels against ground truth when using dev set
