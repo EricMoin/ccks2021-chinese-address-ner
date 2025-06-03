@@ -188,6 +188,8 @@ class AdaptationConfig():
     # Optional: for DataLoader
     num_workers: int
 
+    adapted_model_dir: str
+
     def __init__(self, config_path: str):
         # 从yaml文件加载配置
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -219,6 +221,9 @@ class AdaptationConfig():
         self.warmup_steps = config_dict.get('warmup_steps', 0)
         self.max_grad_norm = config_dict.get('max_grad_norm', 1.0)
         self.mask_probability = config_dict.get('mask_probability', 0.15)
+        self.adapted_model_dir = os.path.join(
+            "pretrained", f"{self.discriminator_model_name_or_path.replace('/', '_')}_electra_adapted_ep{self.num_epochs}_seed{self.seed}"
+        )
 
         self.generator_loss_weight = config_dict.get(
             'generator_loss_weight', 1.0)

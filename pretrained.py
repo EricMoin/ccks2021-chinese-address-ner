@@ -139,8 +139,8 @@ def electra_train(config: AdaptationConfig):
     logger.info(f"模型将保存到: {config.adapted_model_dir}")
 
     # 加载领域语料
-    sentence_reader = SentenceReader(config.corpus_file)
-    texts = sentence_reader.read()
+    sentence_reader = SentenceReader()
+    texts = sentence_reader.read_corpus(config.corpus_file)
     logger.info(f"加载了 {len(texts)} 条语料 from {config.corpus_file}")
 
     # 创建dataset
@@ -193,8 +193,8 @@ def electra_train(config: AdaptationConfig):
     logger.info(
         f"开始ELECTRA训练 (Generator + Discriminator) for {config.num_epochs} epochs")
     config.adapted_model_dir = os.path.join(
-            "pretrained", f"{config.discriminator_model_name_or_path.replace('/', '_')}_electra_adapted_ep{config.num_epochs}_seed{config.seed}"
-        )
+        "pretrained", f"{config.discriminator_model_name_or_path.replace('/', '_')}_electra_adapted_ep{config.num_epochs}_seed{config.seed}"
+    )
     for epoch in range(config.num_epochs):
         epoch_iterator = tqdm(
             dataloader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
@@ -317,7 +317,8 @@ def mlm_train(config: AdaptationConfig):
         "pretrained", f"{config.model_name.replace('/', '_')}_adapted_ep{config.num_epochs}_seed{config.seed}"
     )
     config.adapted_model_path = os.path.join(
-        config.adapted_model_dir, "model.pt" # .save_pretrained saves more than just one file
+        # .save_pretrained saves more than just one file
+        config.adapted_model_dir, "model.pt"
     )
 
     # 设置随机种子
