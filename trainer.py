@@ -1,19 +1,21 @@
-import os
-from sklearn.model_selection import KFold
-import torch
-from config import Config
-from torch import nn
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from transformers import get_cosine_schedule_with_warmup
-import copy
-import logging
+from model import FreeLB, BertBiaffineSpanNER
+from conll_reader import ConllReader
+import torch.nn.functional as F
+import json
+import numpy as np
 from sklearn.metrics import classification_report
+import logging
+import copy
+from transformers import get_linear_schedule_with_warmup, AutoTokenizer
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torch import nn
+from config import Config
+import torch
+from typing import Dict
+import os
+import re
 
-from conll_reader import ConllReader, MultiConllReader
-from dataset import NERDataset, NERTestDataset
-from model import FreeLB, AddressNER
-from label import LabelMap
 
 logger = logging.getLogger(__name__)
 
@@ -76,326 +78,895 @@ class StochasticWeightAveraging:
         return self.swa_model.state_dict()
 
 
-class Trainer:
-    config: Config
-    model: nn.Module
-    train_dataloader: DataLoader
-    val_dataloader: DataLoader
-    device: torch.device
+class SpanConverter:
+    """
+    处理BIOES格式到span格式的转换
+    """
 
-    def __init__(self, config: Config, model: nn.Module, train_dataloader: DataLoader, val_dataloader: DataLoader, device: str):
-        self.config = config
-        self.model = model
-        self.train_dataloader = train_dataloader
-        self.val_dataloader = val_dataloader
-        self.device = torch.device(device)
-        self.scheduler = None  # 初始化调度器属性
+    def __init__(self, labels: list, label_scheme: str = 'BIOES'):
+        self.labels = labels
+        self.label_scheme = label_scheme
 
-        # 如果启用则初始化SWA
-        if self.config.use_swa:
-            self.swa = StochasticWeightAveraging(
-                model=self.model,  # 传递模型实例用于深拷贝基础
-                swa_start_epoch=self.config.swa_start_epoch,
-                swa_lr=self.config.swa_lr,
-                swa_freq=self.config.swa_freq
-            )
-        else:
-            self.swa = None
+        # 构建span标签映射 - 用于span矩阵
+        # 0: O标签, 1+: 实体类型标签
+        self.label_to_id = {'O': 0}
+        self.id_to_label = {0: 'O'}
 
-        self.model.to(self.device)
+        # 为每个实体类型分配ID（不包含BIOES前缀）
+        label_id = 1
+        for label in labels:
+            self.label_to_id[label] = label_id
+            self.id_to_label[label_id] = label
+            label_id += 1
+
+        self.num_labels = len(self.label_to_id)
+
+        # 构建BIOES标签映射（仅用于序列标注兼容性，不用于span矩阵）
+        self.bioes_to_id = {'O': 0}
+        self.id_to_bioes = {0: 'O'}
+
+        idx = 1
+        for label in labels:
+            if label_scheme == 'BIOES':
+                self.bioes_to_id[f'B-{label}'] = idx
+                self.bioes_to_id[f'I-{label}'] = idx + 1
+                self.bioes_to_id[f'E-{label}'] = idx + 2
+                self.bioes_to_id[f'S-{label}'] = idx + 3
+
+                self.id_to_bioes[idx] = f'B-{label}'
+                self.id_to_bioes[idx + 1] = f'I-{label}'
+                self.id_to_bioes[idx + 2] = f'E-{label}'
+                self.id_to_bioes[idx + 3] = f'S-{label}'
+                idx += 4
+
         logger.info(
-            f"训练器已初始化。在{self.device}上训练。工作目录：{self.config.work_dir}")
+            f"SpanConverter初始化: 实体类型={len(labels)}个, 总标签数={self.num_labels}")
 
-    def train(self):
-        self.model.train()  # 确保模型处于训练模式
-        # 优化器
-        optimizer = torch.optim.AdamW([
-            {'params': self.model.bert.embeddings.parameters(
-            ), 'lr': self.config.learning_rate * 5},
-            {'params': self.model.lstm.parameters(
-            ), 'lr': self.config.learning_rate * 25},
-            {'params': self.model.classifier.parameters(
-            ), 'lr': self.config.learning_rate * 25},
-            {'params': self.model.crf.parameters(
-            ), 'lr': self.config.learning_rate * 50}
-        ], lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
+    def bioes_to_spans(self, bioes_sequence: list, text_tokens: list = None) -> list:
+        """
+        将BIOES序列转换为span格式
 
-        total_steps = len(self.train_dataloader) * self.config.num_epochs
-        self.scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1.0, end_factor=0.1, total_iters=total_steps
+        Args:
+            bioes_sequence: BIOES标签序列
+            text_tokens: 对应的文本token序列（用于调试）
+
+        Returns:
+            list: span列表，每个span为(start, end, label)
+        """
+        spans = []
+        current_span = None
+
+        for i, tag in enumerate(bioes_sequence):
+            if tag == 'O':
+                # 结束当前span（如果有）
+                if current_span is not None:
+                    logger.warning(f"Incomplete span found: {current_span}")
+                    current_span = None
+                continue
+
+            if tag.startswith('B-'):
+                # 开始新span
+                if current_span is not None:
+                    logger.warning(f"Incomplete span found: {current_span}")
+                current_span = {'start': i, 'label': tag[2:]}
+
+            elif tag.startswith('I-'):
+                # 继续当前span
+                if current_span is None or current_span['label'] != tag[2:]:
+                    logger.warning(f"Orphaned I- tag at position {i}: {tag}")
+                    current_span = {'start': i, 'label': tag[2:]}
+
+            elif tag.startswith('E-'):
+                # 结束当前span
+                if current_span is None or current_span['label'] != tag[2:]:
+                    logger.warning(f"Orphaned E- tag at position {i}: {tag}")
+                else:
+                    spans.append(
+                        (current_span['start'], i, current_span['label']))
+                current_span = None
+
+            elif tag.startswith('S-'):
+                # 单token span
+                if current_span is not None:
+                    logger.warning(f"Incomplete span found: {current_span}")
+                spans.append((i, i, tag[2:]))
+                current_span = None
+
+        # 处理未完成的span
+        if current_span is not None:
+            logger.warning(f"Incomplete span at end: {current_span}")
+
+        return spans
+
+    def spans_to_matrix(self, spans: list, seq_length: int) -> torch.Tensor:
+        """
+        将span列表转换为span标签矩阵
+
+        Args:
+            spans: span列表，每个span为(start, end, label)
+            seq_length: 序列长度
+
+        Returns:
+            torch.Tensor: [seq_length, seq_length]的标签矩阵
+        """
+        span_matrix = torch.zeros(seq_length, seq_length, dtype=torch.long)
+
+        for start, end, label in spans:
+            if start < seq_length and end < seq_length and start <= end:
+                label_id = self.label_to_id.get(label, 0)  # 默认为O标签
+                if label_id > 0:  # 只设置非O标签
+                    span_matrix[start, end] = label_id
+                else:
+                    # 记录无法找到的标签（可能的数据问题）
+                    if label != 'O':
+                        logger.warning(f"无法找到标签 '{label}' 在label_to_id映射中")
+
+        return span_matrix
+
+    def tokens_to_spans_batch(self, batch_bioes_sequences: list, batch_tokens: list = None) -> list:
+        """
+        批量转换BIOES序列到span格式
+        """
+        batch_spans = []
+        for i, bioes_seq in enumerate(batch_bioes_sequences):
+            tokens = batch_tokens[i] if batch_tokens else None
+            spans = self.bioes_to_spans(bioes_seq, tokens)
+            batch_spans.append(spans)
+        return batch_spans
+
+
+class SpanNERDataset:
+    """
+    Span-based NER数据集类
+    """
+
+    def __init__(self, examples: list, tokenizer_name_or_path, max_length: int, span_converter: SpanConverter):
+        self.examples = examples
+        self.tokenizer_name_or_path = tokenizer_name_or_path  # 存储路径而不是tokenizer对象
+        self.max_length = max_length
+        self.span_converter = span_converter
+        self._tokenizer = None  # 懒加载的tokenizer
+
+    @property
+    def tokenizer(self):
+        """懒加载tokenizer，避免在fork之前初始化"""
+        if self._tokenizer is None:
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.tokenizer_name_or_path)
+        return self._tokenizer
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        example = self.examples[idx]
+
+        # 统一处理字典和对象格式
+        if isinstance(example, dict):
+            tokens = example['tokens']
+            labels = example.get('labels', [])
+        else:
+            tokens = example.tokens
+            labels = getattr(example, 'labels', [])
+
+        # 分词和编码
+        encoding = self.tokenizer(
+            tokens,
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_length,
+            is_split_into_words=True,
+            return_tensors='pt'
         )
 
-        best_val_metric = 0
-        # 折叠特定的工作目录
-        os.makedirs(self.config.work_dir, exist_ok=True)
+        # 处理标签对齐
+        word_ids = encoding.word_ids()
+        aligned_labels = ['O'] * len(word_ids)
 
-        freelb = None
-        if hasattr(self.config, 'adversarial_training_start_epoch') and self.config.adversarial_training_start_epoch >= 0 and self.config.use_freelb:
-            freelb = FreeLB(
-                self.model,
-                adv_lr=self.config.freelb_adv_lr,
-                adv_steps=self.config.freelb_adv_steps,
-                adv_init_mag=self.config.freelb_adv_init_mag,
-                adv_max_norm=self.config.freelb_adv_max_norm,
-                adv_norm_type=self.config.freelb_adv_norm_type,
-                base_model=self.config.freelb_base_model
-            )
-            logger.info("FreeLB对抗训练已配置。")
+        # 从标签获取BIOES格式标签
+        if labels:
+            for i, word_id in enumerate(word_ids):
+                if word_id is not None and word_id < len(labels):
+                    # 直接使用原始标签（应该已经是BIOES格式的字符串）
+                    aligned_labels[i] = labels[word_id]
 
-        for epoch in range(self.config.num_epochs):
-            self.model.train()
-            train_loss = 0
-            train_pbar = tqdm(
-                self.train_dataloader, desc=f"Epoch {epoch+1}/{self.config.num_epochs} [Train] ({os.path.basename(self.config.work_dir)})")
+        # 转换为span格式
+        spans = self.span_converter.bioes_to_spans(aligned_labels)
+        seq_length = encoding['input_ids'].shape[1]
+        span_labels = self.span_converter.spans_to_matrix(spans, seq_length)
 
-            for batch in train_pbar:
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                labels = batch["labels"].to(self.device)
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'span_labels': span_labels
+        }
 
-                optimizer.zero_grad()
 
-                if freelb and epoch >= self.config.adversarial_training_start_epoch:
-                    # 获取FreeLB的原始嵌入
-                    original_embeddings = self.model.bert.embeddings.word_embeddings(
-                        input_ids)
-                    # FreeLB的.attack()方法将处理自己的梯度累积
-                    # 并在其循环之前内部调用self.model.zero_grad()。
-                    adv_loss = freelb.attack(
-                        original_embeddings.detach(), attention_mask, labels)
-                    # 梯度现在已从FreeLB的攻击中在model.parameters()中累积。
-                    # 我们使用adv_loss进行日志记录，但optimizer.step()的梯度来自FreeLB。
-                    current_loss = adv_loss  # 用于日志记录目的
-                else:
-                    # 如果FreeLB未激活，则进行标准前向和后向传播
-                    loss = self.model(input_ids, attention_mask, labels)
-                    loss.backward()
-                    current_loss = loss.item()
+class SpanEvaluator:
+    """
+    Span模型评估器
+    """
 
-                # 梯度裁剪和优化器步骤（适用于标准传播或FreeLB的梯度）
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), max_norm=1.0)
-                optimizer.step()
+    def __init__(self, span_converter: SpanConverter):
+        self.span_converter = span_converter
 
-                if self.scheduler:
-                    self.scheduler.step()
+    def extract_spans_from_matrix(self, span_matrix: torch.Tensor, attention_mask: torch.Tensor) -> list:
+        """
+        从span标签矩阵中提取span列表
 
-                train_loss += current_loss  # 累积损失以计算轮次平均值
-                train_pbar.set_postfix({"loss": f"{current_loss:.4f}"})
+        Args:
+            span_matrix: [seq_len, seq_len] 的标签矩阵
+            attention_mask: [seq_len] 的注意力掩码
 
-            avg_train_loss = train_loss / \
-                len(self.train_dataloader) if len(
-                    self.train_dataloader) > 0 else 0
-            logger.info(
-                f"第{epoch+1}轮 ({os.path.basename(self.config.work_dir)}) 平均训练损失: {avg_train_loss:.4f}")
+        Returns:
+            list: span列表，每个span为(start, end, label)
+        """
+        spans = []
+        seq_len = attention_mask.sum().item()
 
-            # 评估
-            self.model.eval()
-            all_preds_eval = []
-            all_labels_eval = []
-            eval_loss = 0
+        for start in range(seq_len):
+            for end in range(start, seq_len):
+                label_id = span_matrix[start, end].item()
+                if label_id > 0:  # 0是O标签
+                    label = self.span_converter.id_to_label.get(label_id, 'O')
+                    if label != 'O':
+                        spans.append((start, end, label))
 
-            with torch.no_grad():
-                for batch in tqdm(self.val_dataloader, desc=f"Epoch {epoch+1}/{self.config.num_epochs} [Eval] ({os.path.basename(self.config.work_dir)})"):
-                    input_ids_eval = batch["input_ids"].to(self.device)
-                    attention_mask_eval = batch["attention_mask"].to(
-                        self.device)
-                    labels_eval = batch["labels"].to(self.device)
+        return spans
 
-                    loss_eval_batch = self.model(
-                        input_ids_eval, attention_mask_eval, labels_eval)
-                    eval_loss += loss_eval_batch.item()
+    def evaluate_spans(self, predictions: list, gold_spans: list) -> dict:
+        """
+        评估span预测结果
 
-                    predictions_eval = self.model(
-                        input_ids_eval, attention_mask_eval)
+        Args:
+            predictions: 模型预测的span列表
+            gold_spans: 真实的span列表
 
-                    for pred_seq, mask_seq, label_seq in zip(predictions_eval, attention_mask_eval, labels_eval):
-                        true_length = mask_seq.sum().item()
-                        all_preds_eval.extend(pred_seq[:true_length])
-                        all_labels_eval.extend(
-                            label_seq[:true_length].cpu().numpy())
+        Returns:
+            dict: 包含precision, recall, f1的评估结果
+        """
+        true_positives = 0
+        predicted_spans = 0
+        gold_spans_count = 0
 
-            avg_eval_loss = eval_loss / \
-                len(self.val_dataloader) if len(self.val_dataloader) > 0 else 0
-            correct_eval = sum(p == l for p, l in zip(
-                all_preds_eval, all_labels_eval))
-            total_eval = len(all_preds_eval) if len(
-                all_preds_eval) > 0 else 1
-            current_val_metric = correct_eval / total_eval
-            logger.info(
-                f"第{epoch+1}轮 ({os.path.basename(self.config.work_dir)}) 验证损失: {avg_eval_loss:.4f}, 验证准确率: {current_val_metric:.4f}")
+        for pred_spans, gold_spans_batch in zip(predictions, gold_spans):
+            pred_set = set()
+            gold_set = set()
 
-            if total_eval > 0:
-                # 生成并记录分类报告
-                # 确保all_preds_eval和all_labels_eval是整数（标签ID）的扁平列表
-                # 从id获取标签名称
-                target_names = [self.config.label_map.id2label[i] for i in sorted(
-                    list(set(all_labels_eval + all_preds_eval)))]
-                # 在传递给classification_report之前从target_names中过滤掉任何OOD标签
-                # 这假设您的label_map.id2label正确映射所有出现的ID。
-                # all_preds_eval和all_labels_eval包含数字ID也很重要。
-
-                # 处理某些标签可能只出现在预测或真实标签中的情况
-                # 并且可能不在初始标签集中（如果id2label不详尽）
-                # 我们将使用预测或真实中存在的标签，并映射它们。
-                present_label_ids = sorted(
-                    list(set(all_labels_eval).union(set(all_preds_eval))))
-
-                # 确保所有这些ID在id2label中都有映射
-                valid_target_names = []
-                valid_label_ids_for_report = []
-
-                for label_id in present_label_ids:
-                    if label_id in self.config.label_map.id2label:
-                        valid_target_names.append(
-                            self.config.label_map.id2label[label_id])
-                        valid_label_ids_for_report.append(label_id)
+            # 转换预测结果
+            if isinstance(pred_spans, list):
+                for span in pred_spans:
+                    if isinstance(span, dict):
+                        # 关键修复：将预测的label ID转换为字符串标签
+                        label_id = span['label']
+                        if isinstance(label_id, int):
+                            # 使用span_converter将ID转换为标签字符串
+                            label_str = self.span_converter.id_to_label.get(
+                                label_id, 'O')
+                            if label_str != 'O':  # 只添加非O标签的span
+                                pred_set.add(
+                                    (span['start'], span['end'], label_str))
+                        else:
+                            # 如果已经是字符串，直接使用
+                            pred_set.add(
+                                (span['start'], span['end'], label_id))
                     else:
-                        logger.warning(
-                            f"标签ID {label_id} 在预测/金标准标签中找到，但不在id2label映射中。跳过报告。")
+                        pred_set.add(span)  # 已经是tuple格式
 
-                if valid_label_ids_for_report:  # 仅在有有效标签要报告时继续
-                    try:
-                        report = classification_report(
-                            all_labels_eval,
-                            all_preds_eval,
-                            labels=valid_label_ids_for_report,  # 仅使用有名称的ID
-                            target_names=valid_target_names,   # 对应的名称
-                            digits=4,
-                            zero_division=0  # 避免当某个类别没有预测或没有真实样本时的警告
-                        )
-                        logger.info(
-                            f"第{epoch+1}轮分类报告 ({os.path.basename(self.config.work_dir)}):\n{report}")
-                    except ValueError as e:
-                        logger.error(
-                            f"无法生成分类报告: {e}. 预测: {set(all_preds_eval)}, 标签: {set(all_labels_eval)}")
-                else:
-                    logger.warning(
-                        "未找到有效标签来生成分类报告（所有预测/金标准标签都无法映射）。")
+            # 转换金标准
+            for span in gold_spans_batch:
+                gold_set.add(span)
 
-            if self.swa is not None:
-                self.swa.update(epoch, self.model.state_dict())
-            report_dict = classification_report(
-                all_labels_eval,
-                all_preds_eval,
-                labels=valid_label_ids_for_report,
-                target_names=valid_target_names,
-                digits=4,
-                zero_division=0,
-                output_dict=True
-            )
-            micro_f1 = report_dict['weighted avg']['f1-score']
-            current_val_metric = micro_f1  # 使用 Micro-F1 作为 val metric
-            if current_val_metric > best_val_metric:
-                best_val_metric = current_val_metric
-                saved_path = os.path.join(
-                    self.config.work_dir, "best_model.pt")  # 保存在折叠特定目录中
-                torch.save(self.model.state_dict(), saved_path)
-                logger.info(
-                    f"保存新的最佳模型 ({os.path.basename(self.config.work_dir)}) 验证指标: {current_val_metric:.4f} 到 {saved_path}")
+            # 计算指标
+            predicted_spans += len(pred_set)
+            gold_spans_count += len(gold_set)
+            true_positives += len(pred_set & gold_set)
 
-        if self.swa is not None:
-            swa_model_state_dict = self.swa.get_final_model_state_dict()
-            if swa_model_state_dict is not None:
-                swa_save_path = os.path.join(
-                    self.config.work_dir, "swa_model.pt")  # 保存在折叠特定目录中
-                torch.save(swa_model_state_dict, swa_save_path)
-                logger.info(
-                    f"保存最终SWA模型 ({os.path.basename(self.config.work_dir)}) 到 {swa_save_path}")
-        logger.info(
-            f"工作目录训练完成: {self.config.work_dir}")
+        # 计算precision, recall, f1
+        precision = true_positives / predicted_spans if predicted_spans > 0 else 0.0
+        recall = true_positives / gold_spans_count if gold_spans_count > 0 else 0.0
+        f1 = 2 * precision * recall / \
+            (precision + recall) if (precision + recall) > 0 else 0.0
+
+        return {
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'true_positives': true_positives,
+            'predicted_spans': predicted_spans,
+            'gold_spans': gold_spans_count
+        }
 
 
-class KFoldTrainer:
-    def __init__(self, config: Config):
+class BiaffineSpanTrainer:
+    """
+    BERT + Biaffine + Span-based NER训练器
+    针对8GB显存优化
+    """
+
+    def __init__(self, config: Config, device: str = 'cuda'):
         self.config = config
+        self.device = device
 
-    def kfold_train(self):
-        logger.info("--- 开始K折训练流水线 ---")
-        folds_base_dir = os.path.join(
-            self.config.work_dir, self.config.model_name)
-        os.makedirs(folds_base_dir, exist_ok=True)
-        logger.info(
-            f"模型 '{self.config.model_name}' 的K折基础目录: {folds_base_dir}")
+        # 设置随机种子
+        self._set_seed(config.seed)
 
-        multi_reader = MultiConllReader()
-        full_data_conll = list(multi_reader.read(
-            # 句子对象列表
-            [self.config.train_file, self.config.dev_file]))
+        # 初始化数据
+        self._load_data()
 
-        kf = KFold(n_splits=self.config.k_folds, shuffle=True,
-                   random_state=self.config.seed)
+        # 初始化模型
+        self._init_model()
 
-        for fold_idx, (train_indices, val_indices) in enumerate(kf.split(full_data_conll)):
-            fold_num = fold_idx + 1
-            logger.info(
-                f"--- 处理模型 '{self.config.model_name}' 的第 {fold_num}/{self.config.k_folds} 折 ---")
+        # 初始化优化器和调度器
+        self._init_optimizer()
 
-            fold_train_data = [full_data_conll[i] for i in train_indices]
-            fold_val_data = [full_data_conll[i] for i in val_indices]
+        # 初始化对抗训练
+        self._init_adversarial_training()
 
-            # 为此折创建特定配置
-            # 从主配置开始复制
-            fold_cfg = copy.deepcopy(self.config)
-            fold_cfg.work_dir = os.path.join(
-                folds_base_dir, f"fold_{fold_num}")
-            # AddressNER的model_name应该是正在进行k折的适配模型路径
-            fold_cfg.model_name = self.config.model_name
-            os.makedirs(fold_cfg.work_dir, exist_ok=True)
-            logger.info(
-                f"第{fold_num}折配置: work_dir='{fold_cfg.work_dir}', model_name_for_tokenizer='{fold_cfg.model_name}'")
+        # 初始化SWA
+        self._init_swa()
 
-            # 为此折实例化模型（使用fold_cfg.model_name作为分词器）
-            model = AddressNER(num_labels=len(
-                fold_cfg.label_map.labels), config=fold_cfg)
+        # 初始化评估器
+        self.evaluator = SpanEvaluator(self.span_converter)
 
-            # 为此折创建数据集和数据加载器
-            train_dataset = NERDataset(
-                fold_train_data, model.tokenizer, fold_cfg.label_map.label2id)
-            val_dataset = NERDataset(
-                fold_val_data, model.tokenizer, fold_cfg.label_map.label2id)
-            train_loader = DataLoader(
-                train_dataset, batch_size=fold_cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-            val_loader = DataLoader(val_dataset, batch_size=fold_cfg.batch_size,
-                                    shuffle=False, num_workers=4, pin_memory=True)
+        # 训练统计
+        self.global_step = 0
+        self.best_f1 = 0.0
+        self.train_losses = []
+        self.val_metrics = []
 
-            # 为此折实例化并运行训练器
-            trainer_fold = Trainer(config=fold_cfg,
-                                   model=model,
-                                   train_dataloader=train_loader,
-                                   val_dataloader=val_loader,
-                                   device=fold_cfg.device)
-            trainer_fold.train()  # 这将在fold_cfg.work_dir中保存best_model.pt和swa_model.pt
-        logger.info("--- K折训练流水线完成 ---")
+    def _set_seed(self, seed: int):
+        """设置随机种子"""
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
+    def _load_data(self):
+        """加载和预处理数据"""
+        logger.info("Loading span data...")
 
-class SingleTrainer:
-    def __init__(self, config: Config):
-        self.config = config
-
-    def train(self):
-        model = AddressNER(num_labels=len(
-            self.config.label_map.labels), config=self.config)
-        self.config.work_dir = os.path.join(
-            self.config.work_dir, self.config.model_name)
-        os.makedirs(self.config.work_dir, exist_ok=True)
+        # 读取数据
         conll_reader = ConllReader()
         train_data = list(conll_reader.read(self.config.train_file))
         val_data = list(conll_reader.read(self.config.dev_file))
 
-        train_dataset = NERDataset(
-            train_data, model.tokenizer, self.config.label_map.label2id)
-        val_dataset = NERDataset(
-            val_data, model.tokenizer, self.config.label_map.label2id)
-        train_loader = DataLoader(
-            train_dataset, batch_size=self.config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=self.config.batch_size,
-                                shuffle=False, num_workers=4, pin_memory=True)
+        logger.info(f"Raw train data samples: {len(train_data)}")
+        logger.info(f"Raw val data samples: {len(val_data)}")
 
-        # 实例化并运行训练器
-        trainer = Trainer(config=self.config,
-                          model=model,
-                          train_dataloader=train_loader,
-                          val_dataloader=val_loader,
-                          device=self.config.device)
-        trainer.train()
+        # 关键修复：从config中获取正确的实体类型列表
+        if hasattr(self.config, 'label_map') and hasattr(self.config.label_map, 'labels'):
+            # 从完整的BIOES标签列表中提取纯实体类型
+            entity_labels = set()
+            for label in self.config.label_map.labels:
+                if label != 'O' and '-' in label:
+                    # 从BIOES标签中提取实体类型 (如 'B-city' -> 'city')
+                    entity_type = label.split('-', 1)[1]
+                    entity_labels.add(entity_type)
+            entity_labels = sorted(list(entity_labels))
+            logger.info(
+                f"从config.label_map.labels提取实体类型: {len(entity_labels)}个")
+        else:
+            # fallback：从数据中提取实体类型
+            entity_types = set()
+            for sample in train_data[:100]:  # 检查前100个样本
+                labels = getattr(sample, 'labels', []) if hasattr(
+                    sample, 'labels') else sample.get('labels', [])
+                for label in labels:
+                    if label != 'O' and '-' in label:
+                        entity_type = label.split('-', 1)[1]  # 提取实体类型
+                        entity_types.add(entity_type)
+            entity_labels = sorted(list(entity_types))
+            logger.info(f"从数据中提取的实体类型: {len(entity_labels)}个")
+
+        # 验证实体标签列表
+        if not entity_labels:
+            raise ValueError("未找到任何实体类型！请检查config.label_map或数据格式")
+
+        # 创建span转换器 - 传入纯实体类型
+        self.span_converter = SpanConverter(
+            # 这里应该是['prov', 'city', 'district', ...]而不是BIOES格式
+            labels=entity_labels,
+            label_scheme=getattr(self.config.label_map, 'type', 'BIOES') if hasattr(
+                self.config, 'label_map') else 'BIOES'
+        )
+
+        # 创建数据集
+        # tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)  # 注释掉，改为懒加载
+
+        # 针对显存优化的最大长度
+        max_length = getattr(self.config, 'max_sequence_length', 384)
+
+        self.train_dataset = SpanNERDataset(
+            train_data, self.config.model_name, max_length, self.span_converter)  # 传入模型名称
+        self.val_dataset = SpanNERDataset(
+            val_data, self.config.model_name, max_length, self.span_converter)  # 传入模型名称
+
+        self.train_dataloader = DataLoader(
+            self.train_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            pin_memory=True if self.device == 'cuda' else False
+        )
+
+        self.val_dataloader = DataLoader(
+            self.val_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            pin_memory=True if self.device == 'cuda' else False
+        )
+
+        logger.info(f"Train span samples: {len(self.train_dataset)}")
+        logger.info(f"Val span samples: {len(self.val_dataset)}")
+        logger.info(f"Span labels: {self.span_converter.num_labels}")
+
+        # 快速验证数据转换
+        total_spans = 0
+        total_non_zero = 0
+
+        for i in range(min(10, len(self.train_dataset))):  # 只检查前10个样本
+            try:
+                sample_data = self.train_dataset[i]
+                span_labels = sample_data['span_labels']
+                total_spans += span_labels.numel()
+                non_zero_count = (span_labels > 0).sum().item()
+                total_non_zero += non_zero_count
+            except Exception as e:
+                logger.error(f"样本{i}转换失败: {e}")
+
+        if total_non_zero == 0:
+            logger.error("严重错误：没有找到任何非零span标签！数据转换有问题。")
+            logger.error(f"检查的样本数: {min(10, len(self.train_dataset))}")
+            raise ValueError("Span标签转换失败，所有标签都是0")
+        else:
+            logger.info(
+                f"数据转换验证通过: 非零span标签比例={total_non_zero/total_spans:.6f}")
+            logger.info(f"总span位置数: {total_spans}, 非零span数: {total_non_zero}")
+
+    def _init_model(self):
+        """初始化模型"""
+        num_labels = self.span_converter.num_labels
+        self.model = BertBiaffineSpanNER(num_labels, self.config)
+        self.model.to(self.device)
+
+        # 计算参数量
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel()
+                               for p in self.model.parameters() if p.requires_grad)
+
+        logger.info(
+            f"Span model loaded. Total params: {total_params:,}, Trainable: {trainable_params:,}")
+
+        # 检查显存使用
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+            allocated = torch.cuda.memory_allocated() / 1024 / 1024
+            logger.info(f"GPU memory allocated: {allocated:.1f} MB")
+
+    def _init_optimizer(self):
+        """初始化优化器和学习率调度器"""
+        # 分离BERT和其他参数的学习率
+        bert_params = []
+        span_classifier_params = []
+        other_params = []
+
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                if 'bert' in name:
+                    bert_params.append(param)
+                elif 'span_classifier' in name or 'biaffine' in name:
+                    span_classifier_params.append(param)
+                else:
+                    other_params.append(param)
+
+        # 设置不同的学习率
+        bert_lr = self.config.learning_rate
+        span_lr = self.config.learning_rate * 5  # span分类器使用更高的学习率
+        other_lr = self.config.learning_rate * 2  # 其他层使用中等学习率
+
+        optimizer_grouped_parameters = [
+            {'params': bert_params, 'lr': bert_lr,
+                'weight_decay': self.config.weight_decay},
+            {'params': span_classifier_params, 'lr': span_lr,
+                'weight_decay': self.config.weight_decay},
+            {'params': other_params, 'lr': other_lr,
+                'weight_decay': self.config.weight_decay}
+        ]
+
+        self.optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
+
+        # 学习率调度器
+        total_steps = len(self.train_dataloader) * self.config.num_epochs
+        warmup_steps = int(0.1 * total_steps)  # 10% warmup
+
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps
+        )
+
+        logger.info(
+            f"Optimizer initialized for span model. Total steps: {total_steps}, Warmup steps: {warmup_steps}")
+        logger.info(
+            f"Parameter groups: BERT={len(bert_params)}, Span={len(span_classifier_params)}, Other={len(other_params)}")
+
+    def _init_adversarial_training(self):
+        """初始化对抗训练"""
+        self.use_adversarial = getattr(self.config, 'use_freelb', False)
+        if self.use_adversarial:
+            self.freelb = FreeLB(
+                model=self.model,
+                adv_lr=getattr(self.config, 'freelb_adv_lr', 0.05),
+                adv_steps=getattr(self.config, 'freelb_adv_steps', 3),
+                adv_init_mag=getattr(self.config, 'freelb_adv_init_mag', 0.05),
+                adv_max_norm=getattr(self.config, 'freelb_adv_max_norm', 0.07),
+                adv_norm_type=getattr(
+                    self.config, 'freelb_adv_norm_type', 'l2'),
+                base_model=getattr(self.config, 'freelb_base_model', 'bert')
+            )
+            self.adv_start_epoch = getattr(
+                self.config, 'adversarial_training_start_epoch', 3)
+            logger.info(
+                f"FreeLB adversarial training enabled for span model, starting from epoch {self.adv_start_epoch}, base_model={self.config.freelb_base_model}")
+        else:
+            logger.info("FreeLB adversarial training disabled")
+
+    def _init_swa(self):
+        """初始化SWA"""
+        self.use_swa = getattr(self.config, 'use_swa', False)
+        if self.use_swa:
+            self.swa = StochasticWeightAveraging(
+                model=self.model,
+                swa_start_epoch=getattr(self.config, 'swa_start_epoch', 0),
+                swa_lr=getattr(self.config, 'swa_lr', 1e-5),
+                swa_freq=getattr(self.config, 'swa_freq', 2)
+            )
+            logger.info("SWA enabled for span model")
+
+    def train_epoch(self, epoch: int) -> float:
+        """训练一个epoch"""
+        self.model.train()
+        total_loss = 0.0
+        num_batches = len(self.train_dataloader)
+
+        # 是否使用对抗训练
+        use_adv_this_epoch = self.use_adversarial and epoch >= self.adv_start_epoch
+
+        progress_bar = tqdm(self.train_dataloader, desc=f"Span Epoch {epoch}")
+
+        for batch_idx, batch in enumerate(progress_bar):
+            # 移动数据到设备
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
+            span_labels = batch['span_labels'].to(self.device)
+
+            if use_adv_this_epoch:
+                # 对抗训练
+                inputs_embeds = self.model.bert.embeddings.word_embeddings(
+                    input_ids).detach()
+                inputs_embeds.requires_grad_(True)
+
+                loss = self.freelb.attack_span(
+                    inputs_embeds, attention_mask, span_labels)
+
+            else:
+                # 常规训练
+                self.optimizer.zero_grad()
+
+                try:
+                    loss = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        span_labels=span_labels
+                    )
+
+                    # 检查损失值
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        logger.warning(f"Invalid loss detected: {loss}")
+                        continue
+
+                    # 确保损失有梯度
+                    if not loss.requires_grad:
+                        logger.warning("Loss does not require grad!")
+                        continue
+
+                    loss.backward()
+
+                except Exception as e:
+                    logger.error(f"Error during forward pass: {e}")
+                    continue
+
+            # 梯度裁剪
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=1.0)
+
+            # 优化器步骤
+            self.optimizer.step()
+            self.scheduler.step()
+
+            # 统计
+            loss_value = loss
+            total_loss += loss_value
+            self.global_step += 1
+
+            # 更新进度条
+            avg_loss = total_loss / (batch_idx + 1)
+            progress_bar.set_postfix({
+                'loss': f'{loss_value:.4f}',
+                'avg_loss': f'{avg_loss:.4f}',
+                'lr': f'{self.scheduler.get_last_lr()[0]:.2e}',
+                'adv': 'ON' if use_adv_this_epoch else 'OFF'
+            })
+
+            # 显存清理
+            if batch_idx % 100 == 0 and self.device == 'cuda':
+                torch.cuda.empty_cache()
+
+        avg_loss = total_loss / num_batches
+        self.train_losses.append(avg_loss)
+
+        # SWA更新
+        if self.use_swa:
+            self.swa.update(epoch, self.model.state_dict())
+
+        return avg_loss
+
+    def evaluate(self) -> Dict[str, float]:
+        """评估模型"""
+        self.model.eval()
+        all_predictions = []
+        all_gold_standards = []
+        total_loss = 0.0
+        num_batches = len(self.val_dataloader)
+
+        with torch.no_grad():
+            progress_bar = tqdm(self.val_dataloader, desc="Span Evaluating")
+
+            for batch_idx, batch in enumerate(progress_bar):
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                span_labels = batch['span_labels'].to(self.device)
+
+                # 计算损失
+                loss = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    span_labels=span_labels
+                )
+                total_loss += loss
+
+                # 获取预测
+                predictions = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )
+
+                # 提取gold spans
+                batch_size = span_labels.size(0)
+                for i in range(batch_size):
+                    # 预测spans - 使用config中的threshold
+                    pred_spans = predictions[i] if isinstance(predictions, list) else \
+                        self.model.decode_spans(
+                            predictions[i:i+1], attention_mask[i:i+1], threshold=self.config.span_threshold)[0]
+                    all_predictions.append(pred_spans)
+
+                    # Gold spans
+                    gold_spans = self.evaluator.extract_spans_from_matrix(
+                        span_labels[i], attention_mask[i]
+                    )
+                    all_gold_standards.append(gold_spans)
+
+        # 计算评估指标
+        metrics = self.evaluator.evaluate_spans(
+            all_predictions, all_gold_standards)
+        metrics['val_loss'] = total_loss / num_batches
+
+        return metrics
+
+    def train(self) -> float:
+        """完整训练流程"""
+        logger.info("Starting span training...")
+
+        best_f1 = 0.0
+        patience = self.config.early_stopping_patience
+        patience_counter = 0
+
+        for epoch in range(self.config.num_epochs):
+            # 训练
+            train_loss = self.train_epoch(epoch)
+
+            # 评估
+            metrics = self.evaluate()
+            val_f1 = metrics['f1']
+            val_loss = metrics['val_loss']
+
+            # 记录
+            self.val_metrics.append(metrics)
+
+            logger.info(
+                f"Span Epoch {epoch}: "
+                f"train_loss={train_loss:.4f}, "
+                f"val_loss={val_loss:.4f}, "
+                f"val_f1={val_f1:.4f}, "
+                f"val_precision={metrics['precision']:.4f}, "
+                f"val_recall={metrics['recall']:.4f}"
+            )
+
+            # 保存最佳模型
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                self.best_f1 = best_f1
+                patience_counter = 0
+                self._save_model('best_model.pt')
+                logger.info(f"New best span F1: {best_f1:.4f}")
+            else:
+                patience_counter += 1
+
+            # 早停
+            if patience_counter >= patience:
+                logger.info(
+                    f"Early stopping triggered after {patience} epochs without improvement")
+                break
+
+            # 显存清理
+            if self.device == 'cuda':
+                torch.cuda.empty_cache()
+
+        # 使用SWA权重进行最终评估
+        if self.use_swa:
+            logger.info("Evaluating with SWA weights...")
+            swa_state_dict = self.swa.get_final_model_state_dict()
+            if swa_state_dict is not None:
+                self.model.load_state_dict(swa_state_dict)
+                swa_metrics = self.evaluate()
+                logger.info(f"SWA Span F1: {swa_metrics['f1']:.4f}")
+
+                if swa_metrics['f1'] > best_f1:
+                    best_f1 = swa_metrics['f1']
+                    self._save_model('swa_model.pt')
+                    logger.info(f"SWA achieved better span F1: {best_f1:.4f}")
+
+        logger.info(f"Span training completed. Best F1: {best_f1:.4f}")
+        # self._save_training_log()  # 注释掉训练日志保存
+
+        return best_f1
+
+    def _save_model(self, filename: str):
+        """保存模型"""
+        # 提取模型名称（处理不同格式的模型名称）
+        model_name = self.config.model_name
+
+        # 如果是路径格式，提取最后一部分作为模型名称
+        if '/' in model_name:
+            model_name = model_name.split('/')[-1]
+
+        # 如果包含特殊字符，进行清理以确保文件系统兼容性
+        model_name = re.sub(r'[<>:"|?*]', '_', model_name)
+
+        # 创建新的保存路径：result/pretrained/[model_name]/
+        save_dir = os.path.join('result', 'pretrained', model_name)
+        model_path = os.path.join(save_dir, filename)
+
+        # 确保目录存在
+        os.makedirs(save_dir, exist_ok=True)
+
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'config': self.config,
+            'best_f1': self.best_f1,
+            'span_converter': self.span_converter
+        }, model_path)
+
+        logger.info(f"Span model saved to {model_path}")
+
+    def _save_training_log(self):
+        """保存训练日志 - 已禁用"""
+        logger.info("Training log saving disabled")
+        return
+
+    def train_with_kfold_cv(self) -> Dict[str, float]:
+        """
+        使用K折交叉验证进行训练
+
+        Returns:
+            dict: 包含平均性能指标的字典
+        """
+        logger.info(f"Starting {self.config.k_folds}-fold cross validation...")
+
+        from sklearn.model_selection import KFold
+        import numpy as np
+
+        # 合并训练和验证数据进行K折分割
+        all_data = list(self.train_dataset.examples) + \
+            list(self.val_dataset.examples)
+
+        kf = KFold(n_splits=self.config.k_folds, shuffle=True,
+                   random_state=self.config.seed)
+        fold_results = []
+
+        for fold, (train_indices, val_indices) in enumerate(kf.split(all_data)):
+            logger.info(f"Training fold {fold + 1}/{self.config.k_folds}")
+
+            # 分割数据
+            fold_train_data = [all_data[i] for i in train_indices]
+            fold_val_data = [all_data[i] for i in val_indices]
+
+            # 创建新的数据集
+            fold_train_dataset = SpanNERDataset(
+                fold_train_data, self.config.model_name,
+                getattr(self.config, 'max_sequence_length', 384),
+                self.span_converter
+            )
+            fold_val_dataset = SpanNERDataset(
+                fold_val_data, self.config.model_name,
+                getattr(self.config, 'max_sequence_length', 384),
+                self.span_converter
+            )
+
+            # 创建数据加载器
+            fold_train_dataloader = DataLoader(
+                fold_train_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                pin_memory=True if self.device == 'cuda' else False
+            )
+            fold_val_dataloader = DataLoader(
+                fold_val_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=False,
+                pin_memory=True if self.device == 'cuda' else False
+            )
+
+            # 重新初始化模型
+            num_labels = self.span_converter.num_labels
+            self.model = BertBiaffineSpanNER(num_labels, self.config)
+            self.model.to(self.device)
+
+            # 重新初始化优化器
+            self._init_optimizer()
+
+            # 临时替换数据加载器
+            original_train_dataloader = self.train_dataloader
+            original_val_dataloader = self.val_dataloader
+            self.train_dataloader = fold_train_dataloader
+            self.val_dataloader = fold_val_dataloader
+
+            # 训练当前fold
+            fold_best_f1 = self.train()
+            fold_results.append(fold_best_f1)
+
+            # 恢复原始数据加载器
+            self.train_dataloader = original_train_dataloader
+            self.val_dataloader = original_val_dataloader
+
+            logger.info(
+                f"Fold {fold + 1} completed with F1: {fold_best_f1:.4f}")
+
+        # 计算平均性能
+        mean_f1 = np.mean(fold_results)
+        std_f1 = np.std(fold_results)
+
+        logger.info(
+            f"K-fold CV completed. Mean F1: {mean_f1:.4f} ± {std_f1:.4f}")
+        logger.info(f"Individual fold results: {fold_results}")
+
+        # 保存交叉验证结果
+        cv_results = {
+            'mean_f1': mean_f1,
+            'std_f1': std_f1,
+            'fold_results': fold_results,
+            'k_folds': self.config.k_folds
+        }
+
+        # cv_log_path = os.path.join(
+        #     self.config.work_dir, 'kfold_cv_results.json')
+        # os.makedirs(self.config.work_dir, exist_ok=True)
+
+        # import json
+        # with open(cv_log_path, 'w', encoding='utf-8') as f:
+        #     json.dump(cv_results, f, indent=2, ensure_ascii=False)
+
+        # logger.info(f"K-fold CV results saved to {cv_log_path}")
+
+        return cv_results

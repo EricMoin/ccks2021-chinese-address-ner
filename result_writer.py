@@ -1,10 +1,9 @@
 from collections import Counter
 import glob
-import logging
 import os
 
 from config import Config
-from predictor import Predictor
+from predictor import BiaffineSpanPredictor
 from sentence_reader import SentenceReader
 from logger import logger
 
@@ -189,7 +188,7 @@ class ResultWriter:
             return
 
         # 初始化预测器，使用配置中的模型设置
-        predictor = Predictor(model_init_config=self.config)
+        predictor = BiaffineSpanPredictor(config=self.config)
 
         # 存储所有折叠的预测结果
         all_test_predictions_sources = []
@@ -260,7 +259,8 @@ class ResultWriter:
                 example_ensembled_labels_for_tokens.append(majority_label)
             ensembled_final_labels.append(example_ensembled_labels_for_tokens)
 
-        # 生成输出文件路径
+        os.makedirs(self.config.work_dir, exist_ok=True)
+
         ensembled_conll_output_path = os.path.join(
             self.config.work_dir, "ensembled_predictions_pipeline.conll")
 

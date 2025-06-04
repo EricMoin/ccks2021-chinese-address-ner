@@ -39,11 +39,8 @@ class Config:
     freelb_base_model: str
 
     # 损失函数相关
-    crf_transition_penalty: float  # CRF转移惩罚
     focal_loss_alpha: float       # Focal Loss的alpha参数
     focal_loss_gamma: float       # Focal Loss的gamma参数
-    hybrid_loss_weight_crf: float     # 混合损失中CRF的权重
-    hybrid_loss_weight_focal: float   # 混合损失中Focal Loss的权重
 
     # Dropout相关
     spatial_dropout: float    # 空间dropout率
@@ -56,11 +53,10 @@ class Config:
     swa_freq: int           # SWA更新频率
 
     # Span-based和Biaffine相关配置
-    model_type: str          # 模型类型 ('sequence', 'span', 'hybrid')
+    model_type: str          # 模型类型 ('span')
     use_biaffine: bool       # 是否使用biaffine attention
     span_threshold: float    # span预测的置信度阈值
-    sequence_loss_weight: float  # 混合模型中序列标注损失的权重
-    span_loss_weight: float      # 混合模型中span损失的权重
+    span_loss_weight: float      # span损失的权重
     biaffine_hidden_dim: int     # biaffine attention的隐藏维度
     span_dropout: float          # span分类器的dropout率
     span_loss_type: str          # span损失函数类型
@@ -68,6 +64,8 @@ class Config:
     # 其他配置
     seed: int    # 随机种子
     k_folds: int  # K折交叉验证的折数
+    max_sequence_length: int  # 最大序列长度
+    early_stopping_patience: int  # 早停的耐心值
 
     def __init__(self, config_path: str):
         # 从yaml文件加载配置
@@ -108,14 +106,8 @@ class Config:
         self.freelb_base_model = config_dict.get('freelb_base_model', 'bert')
 
         # 设置损失函数相关
-        self.crf_transition_penalty = config_dict.get(
-            'crf_transition_penalty', 0.175)
         self.focal_loss_alpha = config_dict.get('focal_loss_alpha', 0.25)
         self.focal_loss_gamma = config_dict.get('focal_loss_gamma', 1.5)
-        self.hybrid_loss_weight_crf = config_dict.get(
-            'hybrid_loss_weight_crf', 0.5)
-        self.hybrid_loss_weight_focal = config_dict.get(
-            'hybrid_loss_weight_focal', 0.5)
 
         # 设置Dropout相关
         self.spatial_dropout = config_dict.get('spatial_dropout', 0.15)
@@ -129,12 +121,10 @@ class Config:
 
         # 设置Span-based和Biaffine相关配置
         self.model_type = config_dict.get(
-            'model_type', 'sequence')  # 'sequence', 'span', 'hybrid'
+            'model_type', 'span')  # 默认为span
         self.use_biaffine = config_dict.get('use_biaffine', True)
         self.span_threshold = config_dict.get('span_threshold', 0.5)
-        self.sequence_loss_weight = config_dict.get(
-            'sequence_loss_weight', 0.5)
-        self.span_loss_weight = config_dict.get('span_loss_weight', 0.5)
+        self.span_loss_weight = config_dict.get('span_loss_weight', 1.0)
         self.biaffine_hidden_dim = config_dict.get('biaffine_hidden_dim', 512)
         self.span_dropout = config_dict.get('span_dropout', 0.1)
         self.span_loss_type = config_dict.get('span_loss_type', 'combined')
@@ -142,6 +132,9 @@ class Config:
         # 设置其他配置
         self.seed = config_dict.get('seed', 2024)
         self.k_folds = config_dict.get('k_folds', 5)
+        self.max_sequence_length = config_dict.get('max_sequence_length', 384)
+        self.early_stopping_patience = config_dict.get(
+            'early_stopping_patience', 5)
 
         # 处理标签映射
         label_map_dict = config_dict.get('label_map', {})
