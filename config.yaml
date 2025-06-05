@@ -8,39 +8,48 @@ device: 'cuda' # 'cuda' or 'cpu'
 seed: 2025
 
 # Model & Training Hyperparameters (Span-based NER)
-model_name: "hfl/chinese-macbert-base_adapted_ep2_seed2025"  # BERT模型
+model_name: "pretrained/hfl_chinese-macbert-base_adapted_ep2_seed2025"  # BERT模型
 model_type: "span"                # 明确使用span模型
 freeze_bert: false                # 不冻结BERT参数
+freeze_bert_layers: 0             # 冻结前N层BERT层（0=不冻结）
 hidden_dropout_prob: 0.1          # BERT隐藏层dropout
 attention_probs_dropout_prob: 0.1 # BERT注意力dropout
-batch_size: 16                   # 适合8GB显存
-learning_rate: 2e-5              # BERT学习率
-num_epochs: 20                   # 增加训练轮数，从15提升到20
+batch_size: 14                   # 降低batch size以适应增强模型的显存需求
+learning_rate: 1.8e-5            # 稍微降低学习率，让复杂模型更稳定训练
+num_epochs: 25                   # 增加训练轮数，从20提升到25，复杂模型需要更多训练
 weight_decay: 0.01
-warmup_ratio: 0.1
+warmup_ratio: 0.12               # 增加warmup比例，从0.1提升到0.12
 max_grad_norm: 1.0
 gradient_accumulation_steps: 1
 
 # Sequence Length Settings
-max_sequence_length: 384         # 为8GB显存优化
+max_sequence_length: 320         # 降低序列长度以节省显存，从384降低到320
+
+# Enhanced Model Configuration - 新增功能
+use_hierarchical: true            # 启用层次化span分类
+use_boundary_detection: true      # 启用span边界检测
+fusion_layers: 4                  # 多尺度特征融合层数
+biaffine_heads: 6                 # 多头biaffine注意力头数（从4增加到6）
 
 # Optimized Span Model Configuration
 use_biaffine: true               # Use biaffine attention for span classification
 biaffine_hidden_dim: 256         # Biaffine attention hidden dimension
-span_threshold: 0.2              # 进一步降低span预测置信度阈值，从0.3降低到0.2，提高召回率
+span_threshold: 0.15             # 进一步降低span预测置信度阈值，从0.2降低到0.15，提高召回率
 span_dropout: 0.05               # 降低span classifier dropout，从0.1降低到0.05
-span_loss_weight: 1.0            # Weight for span loss
-early_stopping_patience: 10      # 增加early stopping耐心，从8提升到10
+span_loss_weight: 1.0            # 主要span分类损失权重
+boundary_loss_weight: 0.4       # 边界检测损失权重（从0.3增加到0.4）
+hierarchy_loss_weight: 0.3      # 层次化分类损失权重（从0.2增加到0.3）
+early_stopping_patience: 12      # 增加early stopping耐心，从10提升到12
 min_delta: 0.001
 
 # Advanced Span Matrix Optimization
-use_sparse_spans: false          # 关闭稀疏span表示，使用标准密集矩阵
+use_sparse_spans: false          # 不使用稀疏span表示
 enable_intelligent_filtering: true # 启用智能span过滤
 enable_linguistic_constraints: true # 启用基于中文地址的语言学约束
 dynamic_max_span_length: true   # 动态调整最大span长度
 span_efficiency_mode: 'balanced' # 效率模式: 'memory', 'speed', 'balanced'
 
-# Advanced Hybrid Loss Configuration - 调整损失权重以提高精确率
+# Enhanced Loss Configuration - 多任务学习权重
 use_focal_loss: true
 focal_weight: 0.9                # 从0.8提升到0.9，更强调难样本
 focal_loss_alpha: 0.4            # 从0.3提升到0.4，进一步减少易分类样本（负样本）的损失权重
@@ -48,22 +57,22 @@ focal_loss_gamma: 3.0            # 从2.0提升到3.0，更强烈地关注困难
 label_smoothing: 0.03            # 从0.05降低到0.03，减少过度正则化
 
 # Regularization
-spatial_dropout: 0.2
-embedding_dropout: 0.1
+spatial_dropout: 0.05            # 空间dropout
+embedding_dropout: 0.1           # 嵌入层dropout
 
 # Stochastic Weight Averaging (SWA)
 use_swa: true
-swa_start_epoch: 10              # 从0调整到10，在后期进行权重平均
-swa_lr: 1e-5
+swa_start_epoch: 15              # 从10调整到15，在后期进行权重平均
+swa_lr: 8e-6                     # 从1e-5降低到8e-6
 swa_freq: 2
 
 # Adversarial Training (FreeLB)
 use_freelb: true # Set to true to enable FreeLB adversarial training
-adversarial_training_start_epoch: 4  # 从3提升到4，让模型先稳定训练
-freelb_adv_lr: 0.03              # 从0.05降低到0.03，更温和的扰动
+adversarial_training_start_epoch: 5  # 从4提升到5，让复杂模型先稳定训练
+freelb_adv_lr: 0.025             # 从0.03降低到0.025，更温和的扰动
 freelb_adv_steps: 3
-freelb_adv_init_mag: 0.03        # 从0.05降低到0.03
-freelb_adv_max_norm: 0.05        # 从0.07降低到0.05
+freelb_adv_init_mag: 0.025       # 从0.03降低到0.025
+freelb_adv_max_norm: 0.04        # 从0.05降低到0.04
 freelb_adv_norm_type: "l2"
 freelb_base_model: "bert" # Part of the model to apply perturbations
 

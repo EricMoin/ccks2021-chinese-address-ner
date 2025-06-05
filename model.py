@@ -401,610 +401,1021 @@ class EfficientSpanClassifier(nn.Module):
         return span_scores
 
 
+class MultiScaleFeatureFusion(nn.Module):
+    """
+    多尺度特征融合模块，融合BERT不同层的特征
+    """
+
+    def __init__(self, hidden_size, num_layers=4):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        # 不同层的权重学习
+        self.layer_weights = nn.Parameter(torch.ones(num_layers))
+
+        # 特征变换层
+        self.feature_transform = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)
+        ])
+
+        # 融合后的特征变换
+        self.fusion_transform = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+
+    def forward(self, layer_outputs):
+        """
+        Args:
+            layer_outputs: List of tensors from different BERT layers
+                          Each tensor: [batch_size, seq_len, hidden_size]
+        """
+        # 确保我们有足够的层
+        if len(layer_outputs) < self.num_layers:
+            # 如果层数不够，重复最后一层
+            while len(layer_outputs) < self.num_layers:
+                layer_outputs.append(layer_outputs[-1])
+
+        # 只取最后num_layers层
+        layer_outputs = layer_outputs[-self.num_layers:]
+
+        # 对每一层进行变换
+        transformed_layers = []
+        for i, layer_output in enumerate(layer_outputs):
+            transformed = self.feature_transform[i](layer_output)
+            transformed_layers.append(transformed)
+
+        # 计算加权和
+        weights = torch.softmax(self.layer_weights, dim=0)
+        fused_features = sum(
+            w * layer for w, layer in zip(weights, transformed_layers))
+
+        # 最终变换
+        output = self.fusion_transform(fused_features)
+
+        return output
+
+
+class MultiHeadBiaffineAttention(nn.Module):
+    """
+    多头双仿射注意力机制，不同头专注于不同类型的span关系
+    """
+
+    def __init__(self, hidden_size, num_labels, num_heads=4, head_dim=None):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_labels = num_labels
+        self.num_heads = num_heads
+        self.head_dim = head_dim or hidden_size // num_heads
+
+        # 确保维度正确
+        assert self.head_dim * num_heads <= hidden_size
+
+        # 每个头的投影层
+        self.start_projections = nn.ModuleList([
+            nn.Linear(hidden_size, self.head_dim) for _ in range(num_heads)
+        ])
+        self.end_projections = nn.ModuleList([
+            nn.Linear(hidden_size, self.head_dim) for _ in range(num_heads)
+        ])
+
+        # 每个头的双仿射层 - 修复：直接作为参数而不是放在ModuleList中
+        self.biaffine_layers = nn.ParameterList([
+            nn.Parameter(torch.randn(self.head_dim, num_labels, self.head_dim))
+            for _ in range(num_heads)
+        ])
+
+        # 头融合层
+        self.head_fusion = nn.Linear(num_heads * num_labels, num_labels)
+
+        # 层归一化
+        self.layer_norm = nn.LayerNorm(num_labels)
+
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, sequence_output):
+        """
+        Args:
+            sequence_output: [batch_size, seq_len, hidden_size]
+        Returns:
+            span_logits: [batch_size, seq_len, seq_len, num_labels]
+        """
+        batch_size, seq_len, _ = sequence_output.size()
+
+        # 多头计算
+        head_outputs = []
+
+        for head_idx in range(self.num_heads):
+            # 投影到头维度
+            start_repr = self.start_projections[head_idx](
+                sequence_output)  # [batch, seq, head_dim]
+            end_repr = self.end_projections[head_idx](
+                sequence_output)      # [batch, seq, head_dim]
+
+            # 双仿射注意力
+            # [head_dim, num_labels, head_dim]
+            biaffine_weight = self.biaffine_layers[head_idx]
+
+            # 计算双仿射分数 - 修复维度问题
+            # 方法1：使用torch.einsum正确处理3D biaffine weight
+            # start_repr: [batch, seq, head_dim]
+            # biaffine_weight: [head_dim, num_labels, head_dim]
+            # 输出: [batch, seq, num_labels, head_dim]
+            temp = torch.einsum('bsh,hlk->bslk', start_repr, biaffine_weight)
+
+            # temp: [batch, seq, num_labels, head_dim] @ end_repr: [batch, seq, head_dim]
+            # 输出: [batch, seq, num_labels, seq] -> [batch, seq, seq, num_labels]
+            head_logits = torch.einsum('bslk,btk->bslt', temp, end_repr)
+
+            head_outputs.append(head_logits)
+
+        # 融合所有头的输出 [batch, seq, seq, num_heads * num_labels]
+        combined = torch.cat(head_outputs, dim=-1)
+
+        # 投影到最终标签维度
+        # [batch, seq, seq, num_labels]
+        span_logits = self.head_fusion(combined)
+        span_logits = self.layer_norm(span_logits)
+        span_logits = self.dropout(span_logits)
+
+        return span_logits
+
+
+class HierarchicalSpanClassifier(nn.Module):
+    """
+    层次化span分类器，根据地址结构层次分别处理
+    """
+
+    def __init__(self, hidden_size, address_hierarchy, total_labels):
+        super().__init__()
+        self.address_hierarchy = address_hierarchy
+        self.total_labels = total_labels
+
+        # 为每个层次创建专门的分类器
+        self.hierarchy_classifiers = nn.ModuleDict()
+        self.hierarchy_label_maps = {}
+
+        label_offset = 1  # 0 是 'O' 标签
+
+        for level_name, labels in address_hierarchy.items():
+            num_labels_in_level = len(labels) + 1  # +1 for 'O'
+
+            # 创建分类器
+            self.hierarchy_classifiers[level_name] = MultiHeadBiaffineAttention(
+                hidden_size, num_labels_in_level, num_heads=2
+            )
+
+            # 创建标签映射
+            level_map = {'O': 0}
+            for i, label in enumerate(labels):
+                level_map[label] = i + 1
+
+            self.hierarchy_label_maps[level_name] = level_map
+            label_offset += len(labels)
+
+        # 最终融合层 - 修复维度计算
+        # 计算每个层次分类器的输出维度（每个层次输出的实际是num_labels，不是num_labels * num_heads）
+        # MultiHeadBiaffineAttention在最后会通过head_fusion投影回num_labels
+        total_hierarchy_labels = 0
+        for level_name, labels in address_hierarchy.items():
+            num_labels_in_level = len(labels) + 1  # +1 for 'O'
+            total_hierarchy_labels += num_labels_in_level  # 每个层次输出num_labels_in_level维
+
+        self.final_fusion = nn.Sequential(
+            nn.Linear(total_hierarchy_labels, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, total_labels)
+        )
+
+    def forward(self, sequence_output, hierarchy_targets=None):
+        """
+        Args:
+            sequence_output: [batch_size, seq_len, hidden_size]
+            hierarchy_targets: Dict of targets for each hierarchy level (training only)
+        """
+        hierarchy_outputs = {}
+        hierarchy_logits = []
+
+        # 为每个层次计算预测
+        for level_name, classifier in self.hierarchy_classifiers.items():
+            # MultiHeadBiaffineAttention 输出 [batch, seq, seq, level_labels]
+            level_logits = classifier(sequence_output)
+            hierarchy_outputs[level_name] = level_logits
+            hierarchy_logits.append(level_logits)
+
+        # 拼接所有层次的输出
+        # [batch, seq, seq, total_hierarchy_labels]
+        combined_logits = torch.cat(hierarchy_logits, dim=-1)
+
+        # 检查维度，确保final_fusion能够处理
+        batch_size, seq_len, seq_len2, total_dim = combined_logits.shape
+
+        # 将span矩阵展平处理
+        # [batch * seq * seq, total_hierarchy_labels]
+        flattened = combined_logits.view(-1, total_dim)
+
+        # 通过fusion层
+        # [batch * seq * seq, total_labels]
+        fused = self.final_fusion(flattened)
+
+        # 恢复原始形状
+        # [batch, seq, seq, total_labels]
+        final_logits = fused.view(
+            batch_size, seq_len, seq_len2, self.total_labels)
+
+        return final_logits, hierarchy_outputs
+
+
+class SpanBoundaryDetector(nn.Module):
+    """
+    专门的span边界检测模块
+    """
+
+    def __init__(self, hidden_size):
+        super().__init__()
+
+        # 开始边界检测
+        self.start_detector = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size // 2, 1)
+        )
+
+        # 结束边界检测
+        self.end_detector = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size // 2, 1)
+        )
+
+        # 边界一致性检测
+        self.boundary_consistency = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, 1)
+        )
+
+    def forward(self, sequence_output):
+        """
+        Args:
+            sequence_output: [batch_size, seq_len, hidden_size]
+        Returns:
+            start_logits: [batch_size, seq_len]
+            end_logits: [batch_size, seq_len]
+            consistency_matrix: [batch_size, seq_len, seq_len]
+        """
+        batch_size, seq_len, hidden_size = sequence_output.size()
+
+        # 边界检测
+        start_logits = self.start_detector(
+            sequence_output).squeeze(-1)  # [batch, seq]
+        end_logits = self.end_detector(
+            sequence_output).squeeze(-1)      # [batch, seq]
+
+        # 一致性检测 - 计算每对位置的一致性
+        consistency_scores = []
+        for i in range(seq_len):
+            # [batch, seq, hidden]
+            start_repr = sequence_output[:, i:i+1, :].expand(-1, seq_len, -1)
+            end_repr = sequence_output  # [batch, seq, hidden]
+
+            # 拼接start和end表示
+            # [batch, seq, hidden*2]
+            combined = torch.cat([start_repr, end_repr], dim=-1)
+            consistency = self.boundary_consistency(
+                combined).squeeze(-1)  # [batch, seq]
+            consistency_scores.append(consistency)
+
+        consistency_matrix = torch.stack(
+            consistency_scores, dim=1)  # [batch, seq, seq]
+
+        return start_logits, end_logits, consistency_matrix
+
+
+class FreeLB:
+    """
+    FreeLB对抗训练实现，保持原有逻辑
+    """
+
+    def __init__(self, model, adv_lr=0.05, adv_steps=3, adv_init_mag=0.05,
+                 adv_max_norm=0.07, adv_norm_type='l2', base_model='bert'):
+        self.model = model
+        self.adv_lr = adv_lr
+        self.adv_steps = adv_steps
+        self.adv_init_mag = adv_init_mag
+        self.adv_max_norm = adv_max_norm
+        self.adv_norm_type = adv_norm_type
+        self.base_model = base_model
+
+    def attack_span(self, inputs_embeds, attention_mask, span_labels):
+        """针对span模型的对抗训练"""
+        # 初始化扰动
+        if self.adv_init_mag > 0:
+            noise = torch.zeros_like(inputs_embeds).uniform_(
+                -self.adv_init_mag, self.adv_init_mag)
+            noise.requires_grad_()
+        else:
+            noise = torch.zeros_like(inputs_embeds)
+            noise.requires_grad_()
+
+        total_loss = 0
+
+        for step in range(self.adv_steps):
+            # 添加扰动
+            perturbed_embeds = inputs_embeds + noise
+
+            # 前向传播
+            loss = self.model(
+                inputs_embeds=perturbed_embeds,
+                attention_mask=attention_mask,
+                span_labels=span_labels
+            )
+
+            total_loss += loss / self.adv_steps
+
+            # 最后一步不需要计算梯度
+            if step == self.adv_steps - 1:
+                break
+
+            # 计算梯度
+            loss.backward(retain_graph=True)
+
+            # 更新扰动
+            if noise.grad is not None:
+                if self.adv_norm_type == 'l2':
+                    noise_norm = torch.norm(noise.grad, dim=-1, keepdim=True)
+                    noise_grad_normalized = noise.grad / (noise_norm + 1e-8)
+                else:  # linf
+                    noise_grad_normalized = torch.sign(noise.grad)
+
+                noise = noise + self.adv_lr * noise_grad_normalized
+
+                # 限制扰动大小
+                if self.adv_norm_type == 'l2':
+                    noise_norm = torch.norm(noise, dim=-1, keepdim=True)
+                    noise = noise / torch.max(
+                        noise_norm / self.adv_max_norm,
+                        torch.ones_like(noise_norm)
+                    )
+                else:  # linf
+                    noise = torch.clamp(
+                        noise, -self.adv_max_norm, self.adv_max_norm)
+
+                noise = noise.detach()
+                noise.requires_grad_()
+
+        return total_loss
+
+
 class BertBiaffineSpanNER(nn.Module):
     """
-    BERT + Biaffine + Span-based NER模型
-    针对8GB显存优化
+    基于BERT的双仿射网络跨度命名实体识别模型
+
+    该模型结合BERT编码器和双仿射注意力机制来进行基于跨度的命名实体识别。
+    模型架构包括：
+    1. BERT编码器用于序列表示学习
+    2. 多层特征融合
+    3. 双仿射注意力用于跨度分类
+    4. 可选的层次化分类和边界检测
     """
 
     def __init__(self, num_labels: int, config: Config):
         super(BertBiaffineSpanNER, self).__init__()
-        self.num_labels = num_labels
+
         self.config = config
-        self.hidden_dim = 768
+        self.num_labels = num_labels
 
         # BERT编码器
-        self.bert = AutoModel.from_pretrained(config.model_name)
-
-        # 应用dropout
-        self.embedding_dropout = nn.Dropout(config.embedding_dropout)
-        self.spatial_dropout = SpatialDropout(config.spatial_dropout)
-
-        # 可选的BERT投影层，用于维度对齐
-        if hasattr(config, 'use_bert_projection') and config.use_bert_projection:
-            self.use_bert_projection = True
-            self.bert_projection = nn.Linear(
-                self.hidden_dim, config.hidden_dim)
-        else:
-            self.use_bert_projection = False
-
-        # Span分类器
-        self.classifier = EfficientSpanClassifier(
-            hidden_dim=self.hidden_dim,
-            num_labels=num_labels,
-            dropout=config.span_dropout,
-            biaffine_hidden_dim=config.biaffine_hidden_dim,
-            use_biaffine=config.use_biaffine
+        self.bert = AutoModel.from_pretrained(
+            config.model_name,
+            hidden_dropout_prob=getattr(config, 'hidden_dropout_prob', 0.1),
+            attention_probs_dropout_prob=getattr(
+                config, 'attention_probs_dropout_prob', 0.1)
         )
 
-        # 初始化损失函数
-        self._init_loss_function(config)
+        # 获取BERT隐藏层维度
+        self.hidden_size = self.bert.config.hidden_size
 
-        # 初始化权重
-        self._init_weights()
+        # 冻结BERT的前N层
+        if getattr(config, 'freeze_bert_layers', 0) > 0:
+            self._freeze_bert_layers(config.freeze_bert_layers)
 
-        # 冻结BERT层
-        self._freeze_bert_layers(config.freeze_bert_layers)
+        # 空间Dropout层
+        self.spatial_dropout = SpatialDropout(
+            drop_prob=getattr(config, 'spatial_dropout', 0.15)
+        )
+
+        # 嵌入层Dropout
+        self.embedding_dropout = nn.Dropout(
+            p=getattr(config, 'embedding_dropout', 0.15)
+        )
+
+        # 多尺度特征融合（如果启用）
+        if getattr(config, 'use_hierarchical', False):
+            fusion_layers = getattr(config, 'fusion_layers', 4)
+            self.feature_fusion = MultiScaleFeatureFusion(
+                hidden_size=self.hidden_size,
+                num_layers=fusion_layers
+            )
+        else:
+            self.feature_fusion = None
+
+        # 主要的跨度分类器
+        biaffine_hidden_dim = getattr(config, 'biaffine_hidden_dim', 512)
+        span_dropout = getattr(config, 'span_dropout', 0.1)
+        use_biaffine = getattr(config, 'use_biaffine', True)
+
+        if getattr(config, 'use_hierarchical', False):
+            # 使用多头双仿射注意力进行层次化分类
+            biaffine_heads = getattr(config, 'biaffine_heads', 4)
+            self.span_classifier = MultiHeadBiaffineAttention(
+                hidden_size=self.hidden_size,
+                num_labels=num_labels,
+                num_heads=biaffine_heads
+            )
+        else:
+            # 使用标准的高效跨度分类器
+            self.span_classifier = EfficientSpanClassifier(
+                hidden_dim=self.hidden_size,
+                num_labels=num_labels,
+                dropout=span_dropout,
+                biaffine_hidden_dim=biaffine_hidden_dim,
+                use_biaffine=use_biaffine
+            )
+
+        # 边界检测模块（可选）
+        if getattr(config, 'use_boundary_detection', False):
+            self.boundary_detector = SpanBoundaryDetector(self.hidden_size)
+        else:
+            self.boundary_detector = None
+
+        # 损失函数
+        if getattr(config, 'use_focal_loss', False):
+            focal_alpha = getattr(config, 'focal_loss_alpha', 0.25)
+            focal_gamma = getattr(config, 'focal_loss_gamma', 2.0)
+            self.span_loss_fn = SpanFocalLoss(
+                num_classes=num_labels,
+                alpha=focal_alpha,
+                gamma=focal_gamma,
+                reduction='mean'
+            )
+        else:
+            # 使用标签平滑的交叉熵损失
+            label_smoothing = getattr(config, 'label_smoothing', 0.0)
+            self.span_loss_fn = nn.CrossEntropyLoss(
+                ignore_index=-100,
+                label_smoothing=label_smoothing
+            )
+
+        # 损失权重
+        self.span_loss_weight = getattr(config, 'span_loss_weight', 1.0)
+        self.boundary_loss_weight = getattr(
+            config, 'boundary_loss_weight', 0.3)
+        self.hierarchy_loss_weight = getattr(
+            config, 'hierarchy_loss_weight', 0.2)
 
         logger.info(
             f"BertBiaffineSpanNER initialized with {num_labels} labels")
-        logger.info(
-            f"Model size: {sum(p.numel() for p in self.parameters()):,} parameters")
+        logger.info(f"Model configuration: hidden_size={self.hidden_size}, "
+                    f"biaffine_hidden_dim={biaffine_hidden_dim}, "
+                    f"use_biaffine={use_biaffine}, "
+                    f"use_hierarchical={getattr(config, 'use_hierarchical', False)}, "
+                    f"use_boundary_detection={getattr(config, 'use_boundary_detection', False)}")
 
-    def _init_weights(self):
-        """初始化权重"""
-        if self.use_bert_projection:
-            nn.init.xavier_uniform_(self.bert_projection.weight)
-            nn.init.zeros_(self.bert_projection.bias)
-
-    def _init_loss_function(self, config: Config):
-        """初始化损失函数 - 默认使用hybrid"""
-        # 移除多种选项，直接使用改进的混合损失
-        self.loss_fn = AdvancedHybridSpanLoss(
-            num_classes=self.num_labels,
-            focal_weight=getattr(config, 'focal_weight', 0.7),
-            ce_weight=getattr(config, 'ce_weight', 0.3),
-            dice_weight=getattr(config, 'dice_weight', 0.2),
-            alpha=config.focal_loss_alpha,
-            gamma=config.focal_loss_gamma,
-            label_smoothing=getattr(config, 'label_smoothing', 0.1)
-        )
-        logger.info(
-            f"Advanced Hybrid Loss initialized with focal_weight={getattr(config, 'focal_weight', 0.7)}, ce_weight={getattr(config, 'ce_weight', 0.3)}, dice_weight={getattr(config, 'dice_weight', 0.2)}")
-
-    def _freeze_bert_layers(self, num_layers_to_freeze: int):
-        """冻结BERT的前num_layers_to_freeze层"""
-        if num_layers_to_freeze <= 0:
-            return
-
-        # 总是冻结嵌入层
+    def _freeze_bert_layers(self, num_layers: int):
+        """冻结BERT的前N层"""
+        # 冻结嵌入层
         for param in self.bert.embeddings.parameters():
             param.requires_grad = False
 
-        # 冻结前n个编码器层
-        for layer_idx in range(min(num_layers_to_freeze, len(self.bert.encoder.layer))):
-            for param in self.bert.encoder.layer[layer_idx].parameters():
-                param.requires_grad = False
+        # 冻结前N个transformer层
+        if num_layers > 0:
+            for layer_idx in range(min(num_layers, len(self.bert.encoder.layer))):
+                for param in self.bert.encoder.layer[layer_idx].parameters():
+                    param.requires_grad = False
 
-    def forward(self, input_ids=None, attention_mask=None, span_labels=None, inputs_embeds=None):
+        logger.info(f"Frozen first {num_layers} BERT layers")
+
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, span_labels=None):
         """
         前向传播
 
         Args:
-            input_ids: 输入token ids [batch_size, seq_len]
-            attention_mask: 注意力掩码 [batch_size, seq_len]
-            span_labels: span标签矩阵 [batch_size, seq_len, seq_len]，可选
-            inputs_embeds: 输入嵌入，可选
+            input_ids: [batch_size, seq_len] 输入token id
+            attention_mask: [batch_size, seq_len] 注意力掩码
+            inputs_embeds: [batch_size, seq_len, hidden_size] 输入嵌入（用于对抗训练）
+            span_labels: [batch_size, seq_len, seq_len] 跨度标签矩阵（训练时提供）
 
         Returns:
-            训练时返回loss，推理时返回span预测列表
+            如果提供span_labels，返回损失值；否则返回预测logits
         """
-        # 获取BERT输出
+
+        # BERT编码
         if inputs_embeds is not None:
-            outputs = self.bert(inputs_embeds=inputs_embeds,
-                                attention_mask=attention_mask)
+            # 对抗训练模式，使用扰动后的嵌入
+            bert_outputs = self.bert(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
         else:
-            outputs = self.bert(input_ids=input_ids,
-                                attention_mask=attention_mask)
+            # 正常训练/推理模式
+            bert_outputs = self.bert(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
 
-        sequence_output = outputs.last_hidden_state
+        # 获取序列表示
+        # [batch, seq_len, hidden]
+        sequence_output = bert_outputs.last_hidden_state
 
-        # 应用BERT投影（如果启用）
-        if self.use_bert_projection:
-            sequence_output = self.bert_projection(sequence_output)
+        # 应用嵌入层dropout
+        sequence_output = self.embedding_dropout(sequence_output)
 
-        # 分类器计算span分数
-        span_scores = self.classifier(sequence_output, attention_mask)
+        # 多尺度特征融合（如果启用）
+        if self.feature_fusion is not None:
+            # 使用所有隐藏层进行特征融合
+            all_hidden_states = bert_outputs.hidden_states
+            sequence_output = self.feature_fusion(all_hidden_states)
 
+        # 应用空间dropout
+        sequence_output = self.spatial_dropout(sequence_output)
+
+        # 主要跨度分类
+        span_logits = self.span_classifier(sequence_output, attention_mask)
+
+        # 边界检测（如果启用）
+        boundary_outputs = None
+        if self.boundary_detector is not None:
+            start_logits, end_logits, consistency_matrix = self.boundary_detector(
+                sequence_output)
+            boundary_outputs = {
+                'start_logits': start_logits,
+                'end_logits': end_logits,
+                'consistency_matrix': consistency_matrix
+            }
+
+            # 如果提供了标签，计算损失
         if span_labels is not None:
-            # 训练模式：计算损失
-            loss = self.compute_span_loss(
-                span_scores, span_labels, attention_mask)
-            return loss
+            return self._calculate_loss(span_logits, span_labels, attention_mask, boundary_outputs)
+
+        # 推理模式，返回span_logits供后续处理
+        # trainer.py期望能够通过索引访问，所以直接返回span_logits
+        return span_logits
+
+    def _calculate_loss(self, span_logits, span_labels, attention_mask, boundary_outputs=None):
+        """
+        计算训练损失
+
+        Args:
+            span_logits: [batch, seq_len, seq_len, num_labels] 跨度分类logits
+            span_labels: [batch, seq_len, seq_len] 跨度标签
+            attention_mask: [batch, seq_len] 注意力掩码
+            boundary_outputs: 边界检测输出（可选）
+
+        Returns:
+            总损失值
+        """
+
+        # 创建有效跨度掩码
+        batch_size, seq_len = attention_mask.shape
+
+        # 基本的有效跨度掩码（基于attention mask）
+        valid_span_mask = self._create_valid_span_mask(attention_mask)
+
+        # 主要跨度分类损失
+        if isinstance(self.span_loss_fn, SpanFocalLoss):
+            # 使用Focal Loss
+            span_loss = self.span_loss_fn.forward_span(
+                span_logits, span_labels, valid_span_mask
+            )
         else:
-            # 推理模式：返回span预测，使用config中的threshold
-            return self.decode_spans(span_scores, attention_mask, threshold=self.config.span_threshold)
+            # 使用交叉熵损失
+            span_loss = self._compute_span_ce_loss(
+                span_logits, span_labels, valid_span_mask
+            )
 
-    def compute_span_loss(self, span_scores, span_labels, attention_mask):
-        """改进的span损失计算 - 使用智能采样和高效mask"""
-        batch_size, seq_len, _, num_labels = span_scores.size()
-        device = span_scores.device
+        total_loss = self.span_loss_weight * span_loss
 
-        # 更智能的有效span掩码构建
-        valid_span_mask = self._create_intelligent_span_mask(
-            attention_mask, seq_len)
+        # 边界检测损失（如果启用）
+        if boundary_outputs is not None and self.boundary_loss_weight > 0:
+            boundary_loss = self._compute_boundary_loss(
+                boundary_outputs, span_labels, attention_mask
+            )
+            total_loss += self.boundary_loss_weight * boundary_loss
 
-        # 使用新的混合损失函数
-        if hasattr(self.loss_fn, 'forward_span'):
-            loss = self.loss_fn.forward_span(
-                span_scores, span_labels, valid_span_mask)
-        else:
-            # Fallback 处理
-            loss = self._compute_fallback_loss(
-                span_scores, span_labels, valid_span_mask)
+        return total_loss
 
-        # 应用span损失权重
-        loss = loss * self.config.span_loss_weight
-        return loss
+    def _create_valid_span_mask(self, attention_mask):
+        """
+        创建有效跨度掩码
 
-    def _create_intelligent_span_mask(self, attention_mask, seq_len):
-        """创建智能的span掩码，大幅减少无效位置的计算量"""
-        device = attention_mask.device
-        batch_size = attention_mask.size(0)
+        Args:
+            attention_mask: [batch, seq_len]
 
-        # 获取每个样本的有效序列长度
-        effective_lengths = attention_mask.sum(dim=1)  # [batch_size]
+        Returns:
+            valid_span_mask: [batch, seq_len, seq_len]
+        """
+        batch_size, seq_len = attention_mask.shape
 
-        # 创建高效的掩码矩阵
-        valid_span_mask = torch.zeros(
-            batch_size, seq_len, seq_len, device=device)
+        # 创建上三角掩码（只考虑start <= end的跨度）
+        triu_mask = torch.triu(torch.ones(
+            seq_len, seq_len, device=attention_mask.device))
 
-        for batch_idx in range(batch_size):
-            effective_len = effective_lengths[batch_idx].item()
+        # 扩展到batch维度
+        triu_mask = triu_mask.unsqueeze(0).expand(batch_size, -1, -1)
 
-            # 动态确定最大span长度
-            if effective_len <= 64:
-                max_span_length = min(8, effective_len // 3)
-                priority_lengths = [1, 2, 3, 4, 5, 6, 7, 8]
-            elif effective_len <= 128:
-                max_span_length = min(12, effective_len // 4)
-                priority_lengths = [1, 2, 3, 4, 5, 6, 8, 10, 12]
-            elif effective_len <= 256:
-                max_span_length = min(16, effective_len // 6)
-                priority_lengths = [1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16]
-            else:
-                max_span_length = min(20, effective_len // 8)
-                priority_lengths = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 20]
+        # 结合attention mask
+        # valid_span[i, j, k] = 1 当且仅当 j和k都是有效位置且j <= k
+        attention_expanded_i = attention_mask.unsqueeze(
+            2).expand(-1, -1, seq_len)
+        attention_expanded_j = attention_mask.unsqueeze(
+            1).expand(-1, seq_len, -1)
 
-            # 只对有效长度范围内的span设置掩码
-            for span_len in priority_lengths:
-                if span_len > max_span_length:
-                    break
-
-                for start in range(effective_len):
-                    end = start + span_len - 1
-                    if end < effective_len:
-                        # 额外的合理性检查
-                        if self._is_span_position_reasonable(start, end, effective_len):
-                            valid_span_mask[batch_idx, start, end] = 1.0
+        valid_span_mask = triu_mask * attention_expanded_i * attention_expanded_j
 
         return valid_span_mask
 
-    def _is_span_position_reasonable(self, start: int, end: int, seq_len: int) -> bool:
-        """检查span位置的合理性"""
-        span_length = end - start + 1
+    def _compute_span_ce_loss(self, span_logits, span_labels, valid_span_mask):
+        """
+        计算跨度分类的交叉熵损失
 
-        # 避免在序列末尾的padding区域
-        if start >= seq_len * 0.95:
-            return False
+        Args:
+            span_logits: [batch, seq_len, seq_len, num_labels]
+            span_labels: [batch, seq_len, seq_len]
+            valid_span_mask: [batch, seq_len, seq_len]
 
-        # 基于span长度的启发式过滤
-        if span_length == 1:
-            return True  # 单字符span总是合理的
-        elif span_length <= 3:
-            return True  # 短span通常是合理的
-        elif span_length <= 8:
-            # 中等长度span需要更谨慎
-            return start < seq_len * 0.8  # 不能太靠近末尾
-        else:
-            # 长span需要严格条件
-            return start < seq_len * 0.6 and span_length <= 16
-
-        return True
-
-    def _compute_fallback_loss(self, span_scores, span_labels, valid_span_mask):
-        """Fallback损失计算"""
-        span_scores_flat = span_scores.reshape(-1, span_scores.size(-1))
+        Returns:
+            损失值
+        """
+        # 展平处理
+        span_logits_flat = span_logits.reshape(-1, span_logits.size(-1))
         span_labels_flat = span_labels.reshape(-1)
         valid_mask_flat = valid_span_mask.reshape(-1)
 
+        # 只计算有效跨度的损失
         valid_indices = valid_mask_flat > 0
+
         if valid_indices.sum() > 0:
-            valid_scores = span_scores_flat[valid_indices]
+            valid_logits = span_logits_flat[valid_indices]
             valid_labels = span_labels_flat[valid_indices]
-            return F.cross_entropy(valid_scores, valid_labels, reduction='mean')
+
+            loss = F.cross_entropy(
+                valid_logits, valid_labels, reduction='mean')
+            return loss
         else:
-            return span_scores.mean() * 0.0 + 1e-8
+            return torch.tensor(0.0, device=span_logits.device, requires_grad=True)
 
-    def decode_spans(self, span_scores, attention_mask, threshold=0.1):
+    def _compute_boundary_loss(self, boundary_outputs, span_labels, attention_mask):
         """
-        专门针对中文地址NER优化的span解码策略
+        计算边界检测损失
 
-        核心改进：
-        1. 多层次阈值策略：不同类型实体使用不同阈值
-        2. 地址结构约束：利用地址层次结构过滤不合理span
-        3. 冲突解决机制：处理重叠span的优先级选择
-        4. 置信度加权：结合多个指标进行span筛选
+        Args:
+            boundary_outputs: 边界检测输出
+            span_labels: [batch, seq_len, seq_len] 跨度标签
+            attention_mask: [batch, seq_len] 注意力掩码
+
+        Returns:
+            边界损失值
         """
-        batch_size, seq_len, _, num_labels = span_scores.size()
-        predictions = []
+        start_logits = boundary_outputs['start_logits']  # [batch, seq_len]
+        end_logits = boundary_outputs['end_logits']      # [batch, seq_len]
 
-        # 地址层次优先级定义
-        address_hierarchy = {
-            'administrative': ['prov', 'city', 'district', 'devzone', 'town', 'community', 'village_group'],
-            'location': ['road', 'roadno', 'poi', 'subpoi'],
-            'building': ['houseno', 'cellno', 'floorno', 'roomno'],
-            'auxiliary': ['detail', 'assist', 'distance', 'intersection', 'redundant', 'others']
-        }
+        # 从跨度标签中提取边界标签
+        start_labels, end_labels = self._extract_boundary_labels(span_labels)
 
-        # 创建标签优先级映射
-        label_priority = {}
-        for level, (category, labels_in_category) in enumerate(address_hierarchy.items()):
-            for priority, label in enumerate(labels_in_category):
-                label_priority[label] = (level, priority)
+        # 计算边界检测损失
+        start_loss = F.binary_cross_entropy_with_logits(
+            start_logits, start_labels.float(),
+            weight=attention_mask.float(),
+            reduction='mean'
+        )
 
-        for batch_idx in range(batch_size):
-            seq_length = attention_mask[batch_idx].sum().item()
-            batch_span_scores = span_scores[batch_idx,
-                                            :seq_length, :seq_length]
+        end_loss = F.binary_cross_entropy_with_logits(
+            end_logits, end_labels.float(),
+            weight=attention_mask.float(),
+            reduction='mean'
+        )
 
-            # 使用softmax获取概率
-            span_probs = F.softmax(batch_span_scores, dim=-1)
-            max_probs, span_preds = torch.max(span_probs, dim=-1)
+        return (start_loss + end_loss) / 2
 
-            # 收集候选spans
-            candidate_spans = []
+    def _extract_boundary_labels(self, span_labels):
+        """
+        从跨度标签中提取边界标签
 
-            for start in range(seq_length):
-                for end in range(start, seq_length):
-                    pred_label_id = span_preds[start, end].item()
+        Args:
+            span_labels: [batch, seq_len, seq_len]
 
-                    if pred_label_id > 0:  # 不是O标签
-                        confidence = max_probs[start, end].item()
-                        span_length = end - start + 1
+        Returns:
+            start_labels: [batch, seq_len] 开始位置标签
+            end_labels: [batch, seq_len] 结束位置标签
+        """
+        batch_size, seq_len, _ = span_labels.shape
 
-                        # 获取标签名
-                        # 注意：这里需要从外部获取id_to_label映射
-                        # 暂时使用ID，由调用者转换
+        start_labels = torch.zeros(
+            batch_size, seq_len, device=span_labels.device)
+        end_labels = torch.zeros(
+            batch_size, seq_len, device=span_labels.device)
 
-                        # 多层次阈值策略
-                        adjusted_threshold = self._get_adaptive_threshold(
-                            pred_label_id, span_length, seq_length, threshold)
+        # 从跨度矩阵中提取边界信息
+        for b in range(batch_size):
+            for i in range(seq_len):
+                for j in range(i, seq_len):
+                    if span_labels[b, i, j] > 0:  # 非O标签
+                        start_labels[b, i] = 1
+                        end_labels[b, j] = 1
 
-                        if confidence > adjusted_threshold:
-                            # 计算复合置信度分数
-                            composite_score = self._calculate_composite_score(
-                                span_probs[start, end], pred_label_id, start, end, seq_length)
+        return start_labels, end_labels
 
-                            candidate_spans.append({
+    def predict_spans(self, input_ids, attention_mask, span_threshold=None):
+        """
+        预测跨度实体
+
+        Args:
+            input_ids: [batch, seq_len]
+            attention_mask: [batch, seq_len]
+            span_threshold: 置信度阈值
+
+        Returns:
+            预测的跨度列表
+        """
+        if span_threshold is None:
+            span_threshold = getattr(self.config, 'span_threshold', 0.5)
+
+        # 前向传播获取预测结果
+        with torch.no_grad():
+            outputs = self.forward(input_ids=input_ids,
+                                   attention_mask=attention_mask)
+            span_logits = outputs['span_logits']
+
+            # 转换为概率
+            span_probs = F.softmax(span_logits, dim=-1)
+
+            # 提取跨度
+            batch_spans = []
+
+            for batch_idx in range(span_probs.shape[0]):
+                spans = []
+                seq_len = attention_mask[batch_idx].sum().item()
+
+                for start in range(seq_len):
+                    for end in range(start, seq_len):
+                        # 获取最大概率的标签
+                        max_prob, pred_label = span_probs[batch_idx, start, end].max(
+                            dim=-1)
+
+                        # 如果不是O标签且超过阈值
+                        if pred_label.item() > 0 and max_prob.item() > span_threshold:
+                            spans.append({
                                 'start': start,
                                 'end': end,
-                                'label': pred_label_id,
-                                'confidence': confidence,
-                                'composite_score': composite_score,
-                                'span_length': span_length
+                                'label': pred_label.item(),
+                                'confidence': max_prob.item()
                             })
 
-            # 应用地址结构约束和冲突解决
-            final_spans = self._resolve_address_conflicts(
-                candidate_spans, label_priority)
+                batch_spans.append(spans)
 
-            predictions.append(final_spans)
+            return batch_spans
 
-        return predictions
-
-    def _get_adaptive_threshold(self, label_id: int, span_length: int, seq_length: int, base_threshold: float) -> float:
+    def decode_spans(self, span_logits, attention_mask, threshold=0.3):
         """
-        获取自适应阈值，根据标签类型、span长度和序列长度调整 - 进一步优化
+        从span logits中解码出预测的跨度
+
+        Args:
+            span_logits: [batch, seq_len, seq_len, num_labels] 跨度预测logits
+            attention_mask: [batch, seq_len] 注意力掩码
+            threshold: float 基础置信度阈值
+
+        Returns:
+            List[List[Dict]]: 每个样本的预测跨度列表
         """
-        # 基础阈值调整
+        # 转换为概率
+        span_probs = F.softmax(span_logits, dim=-1)
+        batch_size, seq_len, _, num_labels = span_probs.shape
+
+        batch_predictions = []
+
+        for batch_idx in range(batch_size):
+            # 获取有效序列长度
+            valid_len = attention_mask[batch_idx].sum().item()
+
+            # 候选跨度列表
+            candidate_spans = []
+
+            # 遍历所有可能的跨度位置
+            for start in range(valid_len):
+                for end in range(start, min(start + self._get_max_span_length(start, valid_len), valid_len)):
+                    # 获取当前位置的概率分布
+                    prob_dist = span_probs[batch_idx, start, end]
+
+                    # 找到最大概率的标签（排除O标签，索引0）
+                    non_o_probs = prob_dist[1:]  # 排除O标签
+                    if len(non_o_probs) == 0:
+                        continue
+
+                    max_prob, max_label_idx = non_o_probs.max(dim=0)
+                    actual_label_id = max_label_idx.item() + 1  # 加1因为排除了O标签
+
+                    # 计算自适应阈值
+                    adaptive_threshold = self._get_adaptive_threshold(
+                        actual_label_id, end - start + 1, valid_len, threshold
+                    )
+
+                    # 检查是否超过阈值
+                    if max_prob.item() > adaptive_threshold:
+                        # 计算复合置信度分数
+                        composite_score = self._calculate_composite_score(
+                            prob_dist, actual_label_id, start, end, valid_len
+                        )
+
+                        candidate_spans.append({
+                            'start': start,
+                            'end': end,
+                            'label': actual_label_id,
+                            'confidence': max_prob.item(),
+                            'composite_score': composite_score,
+                            'span_length': end - start + 1
+                        })
+
+            # 解决跨度冲突并选择最终预测
+            final_spans = self._resolve_span_conflicts_decode(candidate_spans)
+
+            batch_predictions.append(final_spans)
+
+        return batch_predictions
+
+    def _get_max_span_length(self, start_pos, seq_len):
+        """
+        根据起始位置和序列长度获取最大跨度长度
+
+        Args:
+            start_pos: 起始位置
+            seq_len: 序列长度
+
+        Returns:
+            最大跨度长度
+        """
+        # 基础最大长度限制
+        max_length = getattr(self.config, 'max_span_length', 10)
+
+        # 根据剩余序列长度调整
+        remaining_length = seq_len - start_pos
+
+        return min(max_length, remaining_length)
+
+    def _get_adaptive_threshold(self, label_id, span_length, seq_length, base_threshold):
+        """
+        计算自适应阈值
+
+        Args:
+            label_id: 标签ID
+            span_length: 跨度长度
+            seq_length: 序列长度
+            base_threshold: 基础阈值
+
+        Returns:
+            调整后的阈值
+        """
+        # 基础阈值
         threshold = base_threshold
 
-        # 根据span长度调整 - 进一步降低短span的阈值要求
+        # 根据跨度长度调整：短跨度使用较低阈值，长跨度使用较高阈值
         if span_length == 1:
-            threshold *= 0.6  # 从0.7降低到0.6，单字符span更容易被接受
+            threshold *= 0.8  # 单字符实体较容易识别
         elif span_length <= 3:
-            threshold *= 0.7  # 从0.8降低到0.7，短span适当降低
-        elif span_length <= 8:
-            threshold *= 0.9  # 从1.0降低到0.9，中等长度稍微降低
-        elif span_length <= 15:
-            threshold *= 1.1  # 新增：较长span适中要求
+            threshold *= 0.9  # 短跨度
+        elif span_length <= 6:
+            threshold *= 1.0  # 中等长度
         else:
-            threshold *= 1.2  # 从1.3降低到1.2，超长span要求稍微降低
+            threshold *= 1.2  # 长跨度需要更高置信度
 
-        # 根据序列长度调整 - 更温和的调整
-        if seq_length < 50:
-            threshold *= 0.85   # 从0.9降低到0.85，短序列进一步降低要求
-        elif seq_length > 200:
-            threshold *= 1.05   # 从1.1降低到1.05，长序列要求适当降低
+        # 根据位置调整：序列开头和结尾的实体通常更可靠
+        # 这里可以根据需要添加位置相关的调整
 
-        # 确保阈值在合理范围内，下限进一步降低
-        # 从max(0.05, min(0.8))调整为max(0.03, min(0.75))
-        return max(0.03, min(0.75, threshold))
+        # 确保阈值在合理范围内
+        threshold = max(0.1, min(0.9, threshold))
 
-    def _calculate_composite_score(self, prob_dist: torch.Tensor, pred_label_id: int,
-                                   start: int, end: int, seq_length: int) -> float:
+        return threshold
+
+    def _calculate_composite_score(self, prob_dist, label_id, start, end, seq_length):
         """
-        计算复合置信度分数，结合多个因素 - 优化权重分配
+        计算复合置信度分数
+
+        Args:
+            prob_dist: [num_labels] 概率分布
+            label_id: 预测标签ID
+            start: 起始位置
+            end: 结束位置
+            seq_length: 序列长度
+
+        Returns:
+            复合置信度分数
         """
         # 基础概率分数
-        base_prob = prob_dist[pred_label_id].item()
+        base_score = prob_dist[label_id].item()
 
-        # 计算概率分布的集中度（熵的反向指标）
+        # 熵惩罚：概率分布越分散，置信度越低
         entropy = -(prob_dist * torch.log(prob_dist + 1e-8)).sum().item()
-        concentration = 1.0 / (1.0 + entropy)  # 熵越低，集中度越高
+        max_entropy = math.log(len(prob_dist))
+        entropy_penalty = entropy / max_entropy  # 归一化到[0,1]
 
-        # 位置分数（开始部分得分更高，但不要过于偏向）
-        position_score = 1.0 - (start / seq_length) * 0.2  # 从0.3降低到0.2，减少位置偏见
-
-        # 长度分数（更平缓的分数分布）
+        # 长度奖励/惩罚
         span_length = end - start + 1
-        if span_length <= 2:
-            length_score = 0.85 + span_length * 0.075  # 提升很短span的分数
-        elif span_length <= 5:
-            length_score = 1.0
-        elif span_length <= 10:
-            length_score = 0.95
-        elif span_length <= 20:
-            length_score = 0.9   # 对中长span更宽松
+        if span_length <= 3:
+            length_bonus = 0.1  # 短跨度奖励
+        elif span_length <= 6:
+            length_bonus = 0.0  # 中等长度无调整
         else:
-            length_score = max(0.7, 1.0 - (span_length - 20) * 0.02)  # 更温和的惩罚
+            length_bonus = -0.1  # 长跨度惩罚
 
-        # 调整复合分数权重，更偏向基础概率
-        composite = (base_prob * 0.7 +      # 从0.6提升到0.7，更重视模型概率
-                     concentration * 0.15 +  # 从0.2降低到0.15
-                     position_score * 0.08 +  # 从0.1降低到0.08
-                     length_score * 0.07)     # 从0.1降低到0.07
+        # 位置奖励：开头和结尾的实体通常更可靠
+        position_bonus = 0.0
+        relative_start = start / seq_length
+        relative_end = end / seq_length
 
-        return composite
+        if relative_start < 0.2 or relative_end > 0.8:
+            position_bonus = 0.05
 
-    def _resolve_address_conflicts(self, candidate_spans: list, label_priority: dict) -> list:
+        # 计算最终复合分数
+        composite_score = (
+            base_score * (1.0 - 0.3 * entropy_penalty) +
+            length_bonus +
+            position_bonus
+        )
+
+        return max(0.0, min(1.0, composite_score))
+
+    def _resolve_span_conflicts_decode(self, candidate_spans):
         """
-        解决地址span冲突，基于地址结构优先级 - 更保守的冲突解决
+        解决候选跨度之间的冲突
+
+        Args:
+            candidate_spans: 候选跨度列表
+
+        Returns:
+            解决冲突后的最终跨度列表
         """
         if not candidate_spans:
             return []
 
         # 按复合分数排序
-        sorted_spans = sorted(candidate_spans,
-                              key=lambda x: x['composite_score'],
-                              reverse=True)
+        sorted_spans = sorted(
+            candidate_spans, key=lambda x: x['composite_score'], reverse=True)
 
         final_spans = []
-        occupied_positions = set()
+        used_positions = set()
 
         for span in sorted_spans:
             start, end = span['start'], span['end']
-            span_positions = set(range(start, end + 1))
 
-            # 检查是否与已选择的span冲突
-            if not span_positions & occupied_positions:
-                final_spans.append(span)
-                occupied_positions.update(span_positions)
-            else:
-                # 更宽松的重叠处理：允许更多的边界调整
-                overlap_size = len(span_positions & occupied_positions)
-                if overlap_size < len(span_positions) * 0.4:  # 从0.3提升到0.4，允许更多重叠
-                    # 可以尝试调整边界
-                    available_positions = span_positions - occupied_positions
-                    if len(available_positions) >= max(1, len(span_positions) * 0.25):  # 从0.5降低到0.25，更宽松
-                        # 调整span边界
-                        new_start = min(available_positions)
-                        new_end = max(available_positions)
+            # 检查是否与已选择的跨度冲突
+            conflict = False
+            for pos in range(start, end + 1):
+                if pos in used_positions:
+                    conflict = True
+                    break
 
-                        # 确保调整后的span仍然合理
-                        if new_end >= new_start and (new_end - new_start + 1) >= 1:
-                            adjusted_span = span.copy()
-                            adjusted_span['start'] = new_start
-                            adjusted_span['end'] = new_end
-                            # 从0.8提升到0.9，减少惩罚
-                            adjusted_span['confidence'] *= 0.9
+            if not conflict:
+                # 选择这个跨度
+                final_spans.append({
+                    'start': start,
+                    'end': end,
+                    'label': span['label'],
+                    'confidence': span['confidence']
+                })
 
-                            final_spans.append(adjusted_span)
-                            occupied_positions.update(
-                                range(new_start, new_end + 1))
+                # 标记已使用的位置
+                for pos in range(start, end + 1):
+                    used_positions.add(pos)
 
-        # 按起始位置重新排序
+        # 按起始位置排序
         final_spans.sort(key=lambda x: x['start'])
 
         return final_spans
 
+    def get_model_info(self):
+        """获取模型信息"""
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel()
+                               for p in self.parameters() if p.requires_grad)
 
-class AdvancedHybridSpanLoss(nn.Module):
-    """
-    高级混合span损失函数
-    结合Focal Loss、交叉熵损失和Dice Loss的优势
-    专门针对span NER的类别不平衡问题进行优化
-    """
-
-    def __init__(self, num_classes, focal_weight=0.7, ce_weight=0.3, dice_weight=0.2,
-                 alpha=0.25, gamma=2.0, label_smoothing=0.1):
-        super(AdvancedHybridSpanLoss, self).__init__()
-        self.num_classes = num_classes
-        self.focal_weight = focal_weight
-        self.ce_weight = ce_weight
-        self.dice_weight = dice_weight
-        self.alpha = alpha
-        self.gamma = gamma
-        self.label_smoothing = label_smoothing
-
-        # 预计算的类别权重
-        self.register_buffer('base_class_weights',
-                             self._compute_base_weights())
-
-    def _compute_base_weights(self):
-        """预计算基础类别权重"""
-        weights = torch.ones(self.num_classes)
-        weights[0] = 0.1  # O标签给予很小权重
-        weights[1:] = 3.0  # 实体标签给予较大权重
-        return weights
-
-    def forward_span(self, span_scores, span_labels, valid_span_mask):
-        """优化的span损失前向传播"""
-        # 使用智能采样减少O标签的影响
-        sampled_scores, sampled_labels, sample_weights = self._intelligent_sampling(
-            span_scores, span_labels, valid_span_mask)
-
-        if sampled_scores.size(0) == 0:
-            return span_scores.mean() * 0.0 + 1e-8
-
-        # 计算三种损失的组合
-        focal_loss = self._compute_focal_loss(
-            sampled_scores, sampled_labels, sample_weights)
-        ce_loss = self._compute_weighted_ce_loss(
-            sampled_scores, sampled_labels, sample_weights)
-        dice_loss = self._compute_dice_loss(sampled_scores, sampled_labels)
-
-        # 动态权重调整
-        total_loss = (self.focal_weight * focal_loss +
-                      self.ce_weight * ce_loss +
-                      self.dice_weight * dice_loss)
-
-        return total_loss
-
-    def _intelligent_sampling(self, span_scores, span_labels, valid_span_mask):
-        """智能采样：平衡O标签和实体标签的比例"""
-        # 展平张量
-        span_scores_flat = span_scores.reshape(-1, span_scores.size(-1))
-        span_labels_flat = span_labels.reshape(-1)
-        valid_mask_flat = valid_span_mask.reshape(-1)
-
-        # 获取有效样本
-        valid_indices = valid_mask_flat > 0
-        valid_scores = span_scores_flat[valid_indices]
-        valid_labels = span_labels_flat[valid_indices]
-
-        if valid_scores.size(0) == 0:
-            return torch.empty(0, span_scores.size(-1), device=span_scores.device), \
-                torch.empty(0, dtype=torch.long, device=span_scores.device), \
-                torch.empty(0, device=span_scores.device)
-
-        # 分离O标签和实体标签
-        o_mask = valid_labels == 0
-        entity_mask = valid_labels > 0
-
-        o_indices = torch.where(o_mask)[0]
-        entity_indices = torch.where(entity_mask)[0]
-
-        # 采样策略：确保实体标签不被稀释
-        entity_count = entity_indices.size(0)
-        o_count = o_indices.size(0)
-
-        if entity_count > 0 and o_count > 0:
-            # 限制O标签样本数量，最多是实体标签的2-3倍
-            max_o_samples = min(o_count, entity_count * 3)
-            if o_count > max_o_samples:
-                # 随机采样O标签
-                selected_o_indices = o_indices[torch.randperm(o_count)[
-                    :max_o_samples]]
-            else:
-                selected_o_indices = o_indices
-
-            # 合并索引
-            selected_indices = torch.cat([entity_indices, selected_o_indices])
-        elif entity_count > 0:
-            selected_indices = entity_indices
-        else:
-            # 如果没有实体标签，随机采样一部分O标签
-            max_o_samples = min(o_count, 100)  # 限制O标签数量
-            selected_indices = o_indices[torch.randperm(o_count)[
-                :max_o_samples]]
-
-        # 获取采样后的数据
-        sampled_scores = valid_scores[selected_indices]
-        sampled_labels = valid_labels[selected_indices]
-
-        # 计算样本权重
-        sample_weights = torch.ones_like(sampled_labels, dtype=torch.float)
-        sample_weights[sampled_labels == 0] = 0.2  # O标签权重
-        sample_weights[sampled_labels > 0] = 1.0   # 实体标签权重
-
-        return sampled_scores, sampled_labels, sample_weights
-
-    def _compute_focal_loss(self, scores, labels, sample_weights):
-        """计算加权Focal Loss"""
-        probs = F.softmax(scores, dim=-1)
-        targets_one_hot = F.one_hot(labels, self.num_classes).float()
-        pt = (probs * targets_one_hot).sum(dim=-1)
-
-        # Focal weight
-        focal_weight = (1 - pt) ** self.gamma
-
-        # Alpha weight
-        alpha_weight = torch.where(labels > 0, self.alpha, 1 - self.alpha)
-
-        # Cross entropy
-        ce_loss = F.cross_entropy(scores, labels, reduction='none')
-
-        # 组合权重
-        focal_loss = alpha_weight * focal_weight * sample_weights * ce_loss
-
-        return focal_loss.mean()
-
-    def _compute_weighted_ce_loss(self, scores, labels, sample_weights):
-        """计算加权交叉熵损失"""
-        # 动态计算类别权重
-        unique_labels = torch.unique(labels)
-        class_weights = self.base_class_weights.clone()
-
-        for label in unique_labels:
-            if label > 0:  # 实体标签
-                count = (labels == label).sum().float()
-                total = labels.size(0)
-                # 根据频率调整权重
-                class_weights[label] = torch.clamp(
-                    total / (count * 2), 1.0, 10.0)
-
-        # 标签平滑
-        if self.label_smoothing > 0:
-            smooth_loss = self._label_smoothing_loss(
-                scores, labels, sample_weights)
-            return smooth_loss
-        else:
-            ce_loss = F.cross_entropy(
-                scores, labels, weight=class_weights, reduction='none')
-            return (ce_loss * sample_weights).mean()
-
-    def _compute_dice_loss(self, scores, labels):
-        """计算Dice Loss以进一步平衡类别"""
-        probs = F.softmax(scores, dim=-1)
-        targets_one_hot = F.one_hot(labels, self.num_classes).float()
-
-        dice_losses = []
-        for c in range(1, self.num_classes):  # 跳过O标签
-            pred_c = probs[:, c]
-            target_c = targets_one_hot[:, c]
-
-            intersection = (pred_c * target_c).sum()
-            union = pred_c.sum() + target_c.sum()
-
-            if union > 0:
-                dice_loss = 1 - (2.0 * intersection + 1e-8) / (union + 1e-8)
-                dice_losses.append(dice_loss)
-
-        if dice_losses:
-            return torch.stack(dice_losses).mean()
-        else:
-            return torch.tensor(0.0, device=scores.device)
-
-    def _label_smoothing_loss(self, scores, labels, sample_weights):
-        """标签平滑损失"""
-        log_probs = F.log_softmax(scores, dim=-1)
-        targets_one_hot = F.one_hot(labels, self.num_classes).float()
-
-        # 应用标签平滑
-        smooth_targets = targets_one_hot * (1 - self.label_smoothing) + \
-            self.label_smoothing / self.num_classes
-
-        loss = -(smooth_targets * log_probs).sum(dim=-1)
-        return (loss * sample_weights).mean()
+        return {
+            'model_type': 'BertBiaffineSpanNER',
+            'num_labels': self.num_labels,
+            'hidden_size': self.hidden_size,
+            'total_parameters': total_params,
+            'trainable_parameters': trainable_params,
+            'use_biaffine': getattr(self.config, 'use_biaffine', True),
+            'use_hierarchical': getattr(self.config, 'use_hierarchical', False),
+            'use_boundary_detection': getattr(self.config, 'use_boundary_detection', False)
+        }
