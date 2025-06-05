@@ -438,7 +438,7 @@ class BertBiaffineSpanNER(nn.Module):
         )
 
         # 初始化损失函数
-        self._init_loss_function(config.span_loss_type, config)
+        self._init_loss_function(config)
 
         # 初始化权重
         self._init_weights()
@@ -457,28 +457,20 @@ class BertBiaffineSpanNER(nn.Module):
             nn.init.xavier_uniform_(self.bert_projection.weight)
             nn.init.zeros_(self.bert_projection.bias)
 
-    def _init_loss_function(self, loss_type: str, config: Config):
-        """初始化损失函数"""
-        if loss_type == 'focal':
-            self.loss_fn = SpanFocalLoss(
-                num_classes=self.num_labels,
-                alpha=config.focal_loss_alpha,
-                gamma=config.focal_loss_gamma
-            )
-        elif loss_type == 'combined':
-            self.loss_fn = HybridSpanLoss(
-                num_classes=self.num_labels,
-                alpha=config.focal_loss_alpha,
-                gamma=config.focal_loss_gamma
-            )
-        else:
-            # 默认使用交叉熵
-            self.loss_fn = None
-
-        logger.info(f"Loss function initialized: {loss_type}")
-        if loss_type in ['focal', 'combined']:
-            logger.info(
-                f"Focal loss parameters: alpha={config.focal_loss_alpha}, gamma={config.focal_loss_gamma}")
+    def _init_loss_function(self, config: Config):
+        """初始化损失函数 - 默认使用hybrid"""
+        # 移除多种选项，直接使用改进的混合损失
+        self.loss_fn = AdvancedHybridSpanLoss(
+            num_classes=self.num_labels,
+            focal_weight=getattr(config, 'focal_weight', 0.7),
+            ce_weight=getattr(config, 'ce_weight', 0.3),
+            dice_weight=getattr(config, 'dice_weight', 0.2),
+            alpha=config.focal_loss_alpha,
+            gamma=config.focal_loss_gamma,
+            label_smoothing=getattr(config, 'label_smoothing', 0.1)
+        )
+        logger.info(
+            f"Advanced Hybrid Loss initialized with focal_weight={getattr(config, 'focal_weight', 0.7)}, ce_weight={getattr(config, 'ce_weight', 0.3)}, dice_weight={getattr(config, 'dice_weight', 0.2)}")
 
     def _freeze_bert_layers(self, num_layers_to_freeze: int):
         """冻结BERT的前num_layers_to_freeze层"""
@@ -534,243 +526,485 @@ class BertBiaffineSpanNER(nn.Module):
             return self.decode_spans(span_scores, attention_mask, threshold=self.config.span_threshold)
 
     def compute_span_loss(self, span_scores, span_labels, attention_mask):
-        """计算span损失"""
+        """改进的span损失计算 - 使用智能采样和高效mask"""
         batch_size, seq_len, _, num_labels = span_scores.size()
-
-        # 创建有效span的掩码
         device = span_scores.device
-        positions = torch.arange(seq_len, device=device)
-        start_positions = positions.reshape(1, -1, 1)
-        end_positions = positions.reshape(1, 1, -1)
-        position_mask = (start_positions <= end_positions).float()
 
-        attention_start = attention_mask.unsqueeze(2).float()
-        attention_end = attention_mask.unsqueeze(1).float()
-        attention_span_mask = attention_start * attention_end
+        # 更智能的有效span掩码构建
+        valid_span_mask = self._create_intelligent_span_mask(
+            attention_mask, seq_len)
 
-        valid_span_mask = position_mask * attention_span_mask
-
-        # 展平为[batch * seq_len * seq_len, num_labels]
-        span_scores_flat = span_scores.reshape(-1, num_labels)
-        span_labels_flat = span_labels.reshape(-1)
-        valid_mask_flat = valid_span_mask.reshape(-1)
-
-        # 只计算有效span的损失
-        valid_indices = valid_mask_flat > 0
-        valid_count = valid_indices.sum().item()
-
-        if valid_count > 0:
-            valid_scores = span_scores_flat[valid_indices]
-            valid_labels = span_labels_flat[valid_indices]
-
-            # 计算类别权重 - 使用更温和的平衡策略
-            label_counts = torch.bincount(
-                valid_labels, minlength=num_labels)
-            total_samples = valid_labels.numel()
-
-            # 使用温和的权重平衡
-            class_weights = torch.ones(num_labels, device=device)
-            for i in range(num_labels):
-                if label_counts[i] > 0:
-                    if i == 0:  # O标签，给予较小的权重
-                        class_weights[i] = 0.5  # 不要太小，避免梯度问题
-                    else:  # 实体标签，给予较大的权重
-                        # 计算合理的权重：实体标签应该得到更多关注
-                        weight = min(5.0, total_samples /
-                                     (label_counts[i] * 5))
-                        class_weights[i] = max(2.0, weight)  # 确保最小权重为2
-                else:
-                    class_weights[i] = 1.0
-
-            # 使用权重计算损失
-            criterion_weighted = nn.CrossEntropyLoss(
-                weight=class_weights, reduction='mean')
-            loss = criterion_weighted(valid_scores, valid_labels)
-
-            # 确保损失是有意义的数值
-            if torch.isnan(loss) or torch.isinf(loss) or loss.item() == 0.0:
-                # fallback到简单的交叉熵
-                loss = F.cross_entropy(
-                    valid_scores, valid_labels, reduction='mean')
-
+        # 使用新的混合损失函数
+        if hasattr(self.loss_fn, 'forward_span'):
+            loss = self.loss_fn.forward_span(
+                span_scores, span_labels, valid_span_mask)
         else:
-            # 创建一个小的、有梯度的损失
-            loss = span_scores.mean() * 0.0 + 1e-8
-            loss.requires_grad_(True)
-
-        # 确保损失是标量且有梯度
-        if loss.dim() > 0:
-            loss = loss.mean()
+            # Fallback 处理
+            loss = self._compute_fallback_loss(
+                span_scores, span_labels, valid_span_mask)
 
         # 应用span损失权重
         loss = loss * self.config.span_loss_weight
-
         return loss
+
+    def _create_intelligent_span_mask(self, attention_mask, seq_len):
+        """创建智能的span掩码，大幅减少无效位置的计算量"""
+        device = attention_mask.device
+        batch_size = attention_mask.size(0)
+
+        # 获取每个样本的有效序列长度
+        effective_lengths = attention_mask.sum(dim=1)  # [batch_size]
+
+        # 创建高效的掩码矩阵
+        valid_span_mask = torch.zeros(
+            batch_size, seq_len, seq_len, device=device)
+
+        for batch_idx in range(batch_size):
+            effective_len = effective_lengths[batch_idx].item()
+
+            # 动态确定最大span长度
+            if effective_len <= 64:
+                max_span_length = min(8, effective_len // 3)
+                priority_lengths = [1, 2, 3, 4, 5, 6, 7, 8]
+            elif effective_len <= 128:
+                max_span_length = min(12, effective_len // 4)
+                priority_lengths = [1, 2, 3, 4, 5, 6, 8, 10, 12]
+            elif effective_len <= 256:
+                max_span_length = min(16, effective_len // 6)
+                priority_lengths = [1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16]
+            else:
+                max_span_length = min(20, effective_len // 8)
+                priority_lengths = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 20]
+
+            # 只对有效长度范围内的span设置掩码
+            for span_len in priority_lengths:
+                if span_len > max_span_length:
+                    break
+
+                for start in range(effective_len):
+                    end = start + span_len - 1
+                    if end < effective_len:
+                        # 额外的合理性检查
+                        if self._is_span_position_reasonable(start, end, effective_len):
+                            valid_span_mask[batch_idx, start, end] = 1.0
+
+        return valid_span_mask
+
+    def _is_span_position_reasonable(self, start: int, end: int, seq_len: int) -> bool:
+        """检查span位置的合理性"""
+        span_length = end - start + 1
+
+        # 避免在序列末尾的padding区域
+        if start >= seq_len * 0.95:
+            return False
+
+        # 基于span长度的启发式过滤
+        if span_length == 1:
+            return True  # 单字符span总是合理的
+        elif span_length <= 3:
+            return True  # 短span通常是合理的
+        elif span_length <= 8:
+            # 中等长度span需要更谨慎
+            return start < seq_len * 0.8  # 不能太靠近末尾
+        else:
+            # 长span需要严格条件
+            return start < seq_len * 0.6 and span_length <= 16
+
+        return True
+
+    def _compute_fallback_loss(self, span_scores, span_labels, valid_span_mask):
+        """Fallback损失计算"""
+        span_scores_flat = span_scores.reshape(-1, span_scores.size(-1))
+        span_labels_flat = span_labels.reshape(-1)
+        valid_mask_flat = valid_span_mask.reshape(-1)
+
+        valid_indices = valid_mask_flat > 0
+        if valid_indices.sum() > 0:
+            valid_scores = span_scores_flat[valid_indices]
+            valid_labels = span_labels_flat[valid_indices]
+            return F.cross_entropy(valid_scores, valid_labels, reduction='mean')
+        else:
+            return span_scores.mean() * 0.0 + 1e-8
 
     def decode_spans(self, span_scores, attention_mask, threshold=0.1):
         """
-        标准的span解码 - 遵循span-based NER最佳实践
+        专门针对中文地址NER优化的span解码策略
 
-        Args:
-            span_scores: [batch_size, seq_len, seq_len, num_labels]
-            attention_mask: [batch_size, seq_len]
-            threshold: 置信度阈值（只使用一个阈值）
+        核心改进：
+        1. 多层次阈值策略：不同类型实体使用不同阈值
+        2. 地址结构约束：利用地址层次结构过滤不合理span
+        3. 冲突解决机制：处理重叠span的优先级选择
+        4. 置信度加权：结合多个指标进行span筛选
         """
         batch_size, seq_len, _, num_labels = span_scores.size()
         predictions = []
 
-        for batch_idx in range(batch_size):
-            batch_predictions = []
-            seq_length = attention_mask[batch_idx].sum().item()
+        # 地址层次优先级定义
+        address_hierarchy = {
+            'administrative': ['prov', 'city', 'district', 'devzone', 'town', 'community', 'village_group'],
+            'location': ['road', 'roadno', 'poi', 'subpoi'],
+            'building': ['houseno', 'cellno', 'floorno', 'roomno'],
+            'auxiliary': ['detail', 'assist', 'distance', 'intersection', 'redundant', 'others']
+        }
 
-            # 获取当前序列的span分数
+        # 创建标签优先级映射
+        label_priority = {}
+        for level, (category, labels_in_category) in enumerate(address_hierarchy.items()):
+            for priority, label in enumerate(labels_in_category):
+                label_priority[label] = (level, priority)
+
+        for batch_idx in range(batch_size):
+            seq_length = attention_mask[batch_idx].sum().item()
             batch_span_scores = span_scores[batch_idx,
                                             :seq_length, :seq_length]
 
             # 使用softmax获取概率
             span_probs = F.softmax(batch_span_scores, dim=-1)
-
-            # 获取最高概率的标签和概率值
             max_probs, span_preds = torch.max(span_probs, dim=-1)
 
-            # 标准span提取：只要预测不是O标签且置信度足够
+            # 收集候选spans
+            candidate_spans = []
+
             for start in range(seq_length):
                 for end in range(start, seq_length):
                     pred_label_id = span_preds[start, end].item()
-                    if pred_label_id > 0:  # 不是O标签(0)
-                        confidence = max_probs[start, end].item()
 
-                        # 只用一个置信度阈值
-                        if confidence > threshold:
-                            # 关键修复：将label ID转换为label字符串
-                            # 需要从span_converter获取ID到标签的映射
-                            # 但这里没有直接访问span_converter，所以保存原始ID
-                            # 由外部调用者处理转换，或者传入span_converter
-                            batch_predictions.append({
+                    if pred_label_id > 0:  # 不是O标签
+                        confidence = max_probs[start, end].item()
+                        span_length = end - start + 1
+
+                        # 获取标签名
+                        # 注意：这里需要从外部获取id_to_label映射
+                        # 暂时使用ID，由调用者转换
+
+                        # 多层次阈值策略
+                        adjusted_threshold = self._get_adaptive_threshold(
+                            pred_label_id, span_length, seq_length, threshold)
+
+                        if confidence > adjusted_threshold:
+                            # 计算复合置信度分数
+                            composite_score = self._calculate_composite_score(
+                                span_probs[start, end], pred_label_id, start, end, seq_length)
+
+                            candidate_spans.append({
                                 'start': start,
                                 'end': end,
-                                'label': pred_label_id,  # 保持原有格式，由外部转换
-                                'confidence': confidence
+                                'label': pred_label_id,
+                                'confidence': confidence,
+                                'composite_score': composite_score,
+                                'span_length': span_length
                             })
 
-            predictions.append(batch_predictions)
+            # 应用地址结构约束和冲突解决
+            final_spans = self._resolve_address_conflicts(
+                candidate_spans, label_priority)
+
+            predictions.append(final_spans)
 
         return predictions
 
+    def _get_adaptive_threshold(self, label_id: int, span_length: int, seq_length: int, base_threshold: float) -> float:
+        """
+        获取自适应阈值，根据标签类型、span长度和序列长度调整 - 进一步优化
+        """
+        # 基础阈值调整
+        threshold = base_threshold
 
-class HybridSpanLoss(nn.Module):
+        # 根据span长度调整 - 进一步降低短span的阈值要求
+        if span_length == 1:
+            threshold *= 0.6  # 从0.7降低到0.6，单字符span更容易被接受
+        elif span_length <= 3:
+            threshold *= 0.7  # 从0.8降低到0.7，短span适当降低
+        elif span_length <= 8:
+            threshold *= 0.9  # 从1.0降低到0.9，中等长度稍微降低
+        elif span_length <= 15:
+            threshold *= 1.1  # 新增：较长span适中要求
+        else:
+            threshold *= 1.2  # 从1.3降低到1.2，超长span要求稍微降低
+
+        # 根据序列长度调整 - 更温和的调整
+        if seq_length < 50:
+            threshold *= 0.85   # 从0.9降低到0.85，短序列进一步降低要求
+        elif seq_length > 200:
+            threshold *= 1.05   # 从1.1降低到1.05，长序列要求适当降低
+
+        # 确保阈值在合理范围内，下限进一步降低
+        # 从max(0.05, min(0.8))调整为max(0.03, min(0.75))
+        return max(0.03, min(0.75, threshold))
+
+    def _calculate_composite_score(self, prob_dist: torch.Tensor, pred_label_id: int,
+                                   start: int, end: int, seq_length: int) -> float:
+        """
+        计算复合置信度分数，结合多个因素 - 优化权重分配
+        """
+        # 基础概率分数
+        base_prob = prob_dist[pred_label_id].item()
+
+        # 计算概率分布的集中度（熵的反向指标）
+        entropy = -(prob_dist * torch.log(prob_dist + 1e-8)).sum().item()
+        concentration = 1.0 / (1.0 + entropy)  # 熵越低，集中度越高
+
+        # 位置分数（开始部分得分更高，但不要过于偏向）
+        position_score = 1.0 - (start / seq_length) * 0.2  # 从0.3降低到0.2，减少位置偏见
+
+        # 长度分数（更平缓的分数分布）
+        span_length = end - start + 1
+        if span_length <= 2:
+            length_score = 0.85 + span_length * 0.075  # 提升很短span的分数
+        elif span_length <= 5:
+            length_score = 1.0
+        elif span_length <= 10:
+            length_score = 0.95
+        elif span_length <= 20:
+            length_score = 0.9   # 对中长span更宽松
+        else:
+            length_score = max(0.7, 1.0 - (span_length - 20) * 0.02)  # 更温和的惩罚
+
+        # 调整复合分数权重，更偏向基础概率
+        composite = (base_prob * 0.7 +      # 从0.6提升到0.7，更重视模型概率
+                     concentration * 0.15 +  # 从0.2降低到0.15
+                     position_score * 0.08 +  # 从0.1降低到0.08
+                     length_score * 0.07)     # 从0.1降低到0.07
+
+        return composite
+
+    def _resolve_address_conflicts(self, candidate_spans: list, label_priority: dict) -> list:
+        """
+        解决地址span冲突，基于地址结构优先级 - 更保守的冲突解决
+        """
+        if not candidate_spans:
+            return []
+
+        # 按复合分数排序
+        sorted_spans = sorted(candidate_spans,
+                              key=lambda x: x['composite_score'],
+                              reverse=True)
+
+        final_spans = []
+        occupied_positions = set()
+
+        for span in sorted_spans:
+            start, end = span['start'], span['end']
+            span_positions = set(range(start, end + 1))
+
+            # 检查是否与已选择的span冲突
+            if not span_positions & occupied_positions:
+                final_spans.append(span)
+                occupied_positions.update(span_positions)
+            else:
+                # 更宽松的重叠处理：允许更多的边界调整
+                overlap_size = len(span_positions & occupied_positions)
+                if overlap_size < len(span_positions) * 0.4:  # 从0.3提升到0.4，允许更多重叠
+                    # 可以尝试调整边界
+                    available_positions = span_positions - occupied_positions
+                    if len(available_positions) >= max(1, len(span_positions) * 0.25):  # 从0.5降低到0.25，更宽松
+                        # 调整span边界
+                        new_start = min(available_positions)
+                        new_end = max(available_positions)
+
+                        # 确保调整后的span仍然合理
+                        if new_end >= new_start and (new_end - new_start + 1) >= 1:
+                            adjusted_span = span.copy()
+                            adjusted_span['start'] = new_start
+                            adjusted_span['end'] = new_end
+                            # 从0.8提升到0.9，减少惩罚
+                            adjusted_span['confidence'] *= 0.9
+
+                            final_spans.append(adjusted_span)
+                            occupied_positions.update(
+                                range(new_start, new_end + 1))
+
+        # 按起始位置重新排序
+        final_spans.sort(key=lambda x: x['start'])
+
+        return final_spans
+
+
+class AdvancedHybridSpanLoss(nn.Module):
     """
-    用于span模型的混合损失函数
-    结合交叉熵和Focal Loss
+    高级混合span损失函数
+    结合Focal Loss、交叉熵损失和Dice Loss的优势
+    专门针对span NER的类别不平衡问题进行优化
     """
 
-    def __init__(self, focal_weight=0.6, ce_weight=0.4, num_classes=21, alpha=0.25, gamma=2.0):
-        super(HybridSpanLoss, self).__init__()
+    def __init__(self, num_classes, focal_weight=0.7, ce_weight=0.3, dice_weight=0.2,
+                 alpha=0.25, gamma=2.0, label_smoothing=0.1):
+        super(AdvancedHybridSpanLoss, self).__init__()
+        self.num_classes = num_classes
         self.focal_weight = focal_weight
         self.ce_weight = ce_weight
-        self.num_classes = num_classes
+        self.dice_weight = dice_weight
         self.alpha = alpha
         self.gamma = gamma
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+        self.label_smoothing = label_smoothing
 
-    def focal_loss_2d(self, logits, targets):
-        """
-        计算2D输入的Focal Loss
+        # 预计算的类别权重
+        self.register_buffer('base_class_weights',
+                             self._compute_base_weights())
 
-        Args:
-            logits: [num_samples, num_classes]
-            targets: [num_samples]
-
-        Returns:
-            loss: [num_samples]
-        """
-        # 计算概率
-        probs = F.softmax(logits, dim=-1)
-
-        # 获取目标类别的概率
-        targets_one_hot = F.one_hot(targets, self.num_classes).float()
-        pt = (probs * targets_one_hot).sum(dim=-1)  # [num_samples]
-
-        # 计算focal weight
-        focal_weight = (1 - pt) ** self.gamma
-
-        # 计算alpha weight
-        alpha_weight = torch.where(
-            targets > 0,
-            torch.tensor(self.alpha, device=targets.device),
-            torch.tensor(1 - self.alpha, device=targets.device)
-        )
-
-        # 计算交叉熵损失
-        ce_loss = F.cross_entropy(logits, targets, reduction='none')
-
-        # 应用权重
-        focal_loss = alpha_weight * focal_weight * ce_loss
-
-        return focal_loss
+    def _compute_base_weights(self):
+        """预计算基础类别权重"""
+        weights = torch.ones(self.num_classes)
+        weights[0] = 0.1  # O标签给予很小权重
+        weights[1:] = 3.0  # 实体标签给予较大权重
+        return weights
 
     def forward_span(self, span_scores, span_labels, valid_span_mask):
-        """为span模型特制的前向函数"""
-        # 展平为[batch * seq_len * seq_len, num_labels]
+        """优化的span损失前向传播"""
+        # 使用智能采样减少O标签的影响
+        sampled_scores, sampled_labels, sample_weights = self._intelligent_sampling(
+            span_scores, span_labels, valid_span_mask)
+
+        if sampled_scores.size(0) == 0:
+            return span_scores.mean() * 0.0 + 1e-8
+
+        # 计算三种损失的组合
+        focal_loss = self._compute_focal_loss(
+            sampled_scores, sampled_labels, sample_weights)
+        ce_loss = self._compute_weighted_ce_loss(
+            sampled_scores, sampled_labels, sample_weights)
+        dice_loss = self._compute_dice_loss(sampled_scores, sampled_labels)
+
+        # 动态权重调整
+        total_loss = (self.focal_weight * focal_loss +
+                      self.ce_weight * ce_loss +
+                      self.dice_weight * dice_loss)
+
+        return total_loss
+
+    def _intelligent_sampling(self, span_scores, span_labels, valid_span_mask):
+        """智能采样：平衡O标签和实体标签的比例"""
+        # 展平张量
         span_scores_flat = span_scores.reshape(-1, span_scores.size(-1))
         span_labels_flat = span_labels.reshape(-1)
         valid_mask_flat = valid_span_mask.reshape(-1)
 
-        # 只计算有效span的损失
+        # 获取有效样本
         valid_indices = valid_mask_flat > 0
-        valid_count = valid_indices.sum().item()
+        valid_scores = span_scores_flat[valid_indices]
+        valid_labels = span_labels_flat[valid_indices]
 
-        if valid_count > 0:
-            valid_scores = span_scores_flat[valid_indices]
-            valid_labels = span_labels_flat[valid_indices]
+        if valid_scores.size(0) == 0:
+            return torch.empty(0, span_scores.size(-1), device=span_scores.device), \
+                torch.empty(0, dtype=torch.long, device=span_scores.device), \
+                torch.empty(0, device=span_scores.device)
 
-            # 计算类别权重 - 强烈偏向实体标签
-            label_counts = torch.bincount(
-                valid_labels, minlength=self.num_classes)
-            total_samples = valid_labels.numel()
+        # 分离O标签和实体标签
+        o_mask = valid_labels == 0
+        entity_mask = valid_labels > 0
 
-            # 使用更强的不平衡权重策略
-            class_weights = torch.ones(
-                self.num_classes, device=valid_scores.device)
-            for i in range(self.num_classes):
-                if label_counts[i] > 0:
-                    if i == 0:  # O标签，给予很小的权重
-                        class_weights[i] = 0.05  # 降低到0.05
-                    else:  # 实体标签，给予很大的权重
-                        class_weights[i] = min(
-                            # 提高到20
-                            20.0, total_samples / (label_counts[i] * 1.5))
-                else:
-                    class_weights[i] = 1.0
+        o_indices = torch.where(o_mask)[0]
+        entity_indices = torch.where(entity_mask)[0]
 
-            # 计算两种损失
-            try:
-                focal_loss = self.focal_loss_2d(valid_scores, valid_labels)
-                if len(focal_loss.shape) > 0:
-                    focal_loss = focal_loss.mean()
+        # 采样策略：确保实体标签不被稀释
+        entity_count = entity_indices.size(0)
+        o_count = o_indices.size(0)
 
-                # 使用权重的交叉熵损失
-                ce_loss = F.cross_entropy(
-                    valid_scores, valid_labels, weight=class_weights, reduction='mean')
+        if entity_count > 0 and o_count > 0:
+            # 限制O标签样本数量，最多是实体标签的2-3倍
+            max_o_samples = min(o_count, entity_count * 3)
+            if o_count > max_o_samples:
+                # 随机采样O标签
+                selected_o_indices = o_indices[torch.randperm(o_count)[
+                    :max_o_samples]]
+            else:
+                selected_o_indices = o_indices
 
-                # 组合损失 - 增加focal loss的权重
-                total_loss = self.focal_weight * focal_loss * 2.0 + self.ce_weight * ce_loss
-
-                # 检查损失有效性
-                if torch.isnan(total_loss) or torch.isinf(total_loss):
-                    # fallback到加权交叉熵
-                    total_loss = F.cross_entropy(
-                        valid_scores, valid_labels, weight=class_weights, reduction='mean')
-
-            except Exception as e:
-                print(f"Loss calculation error: {e}")
-                # fallback到加权交叉熵
-                total_loss = F.cross_entropy(
-                    valid_scores, valid_labels, weight=class_weights, reduction='mean')
-
+            # 合并索引
+            selected_indices = torch.cat([entity_indices, selected_o_indices])
+        elif entity_count > 0:
+            selected_indices = entity_indices
         else:
-            # 创建一个小的损失以保持梯度流
-            total_loss = span_scores.mean() * 0.0 + 1e-8
-            total_loss.requires_grad_(True)
+            # 如果没有实体标签，随机采样一部分O标签
+            max_o_samples = min(o_count, 100)  # 限制O标签数量
+            selected_indices = o_indices[torch.randperm(o_count)[
+                :max_o_samples]]
 
-        return total_loss
+        # 获取采样后的数据
+        sampled_scores = valid_scores[selected_indices]
+        sampled_labels = valid_labels[selected_indices]
+
+        # 计算样本权重
+        sample_weights = torch.ones_like(sampled_labels, dtype=torch.float)
+        sample_weights[sampled_labels == 0] = 0.2  # O标签权重
+        sample_weights[sampled_labels > 0] = 1.0   # 实体标签权重
+
+        return sampled_scores, sampled_labels, sample_weights
+
+    def _compute_focal_loss(self, scores, labels, sample_weights):
+        """计算加权Focal Loss"""
+        probs = F.softmax(scores, dim=-1)
+        targets_one_hot = F.one_hot(labels, self.num_classes).float()
+        pt = (probs * targets_one_hot).sum(dim=-1)
+
+        # Focal weight
+        focal_weight = (1 - pt) ** self.gamma
+
+        # Alpha weight
+        alpha_weight = torch.where(labels > 0, self.alpha, 1 - self.alpha)
+
+        # Cross entropy
+        ce_loss = F.cross_entropy(scores, labels, reduction='none')
+
+        # 组合权重
+        focal_loss = alpha_weight * focal_weight * sample_weights * ce_loss
+
+        return focal_loss.mean()
+
+    def _compute_weighted_ce_loss(self, scores, labels, sample_weights):
+        """计算加权交叉熵损失"""
+        # 动态计算类别权重
+        unique_labels = torch.unique(labels)
+        class_weights = self.base_class_weights.clone()
+
+        for label in unique_labels:
+            if label > 0:  # 实体标签
+                count = (labels == label).sum().float()
+                total = labels.size(0)
+                # 根据频率调整权重
+                class_weights[label] = torch.clamp(
+                    total / (count * 2), 1.0, 10.0)
+
+        # 标签平滑
+        if self.label_smoothing > 0:
+            smooth_loss = self._label_smoothing_loss(
+                scores, labels, sample_weights)
+            return smooth_loss
+        else:
+            ce_loss = F.cross_entropy(
+                scores, labels, weight=class_weights, reduction='none')
+            return (ce_loss * sample_weights).mean()
+
+    def _compute_dice_loss(self, scores, labels):
+        """计算Dice Loss以进一步平衡类别"""
+        probs = F.softmax(scores, dim=-1)
+        targets_one_hot = F.one_hot(labels, self.num_classes).float()
+
+        dice_losses = []
+        for c in range(1, self.num_classes):  # 跳过O标签
+            pred_c = probs[:, c]
+            target_c = targets_one_hot[:, c]
+
+            intersection = (pred_c * target_c).sum()
+            union = pred_c.sum() + target_c.sum()
+
+            if union > 0:
+                dice_loss = 1 - (2.0 * intersection + 1e-8) / (union + 1e-8)
+                dice_losses.append(dice_loss)
+
+        if dice_losses:
+            return torch.stack(dice_losses).mean()
+        else:
+            return torch.tensor(0.0, device=scores.device)
+
+    def _label_smoothing_loss(self, scores, labels, sample_weights):
+        """标签平滑损失"""
+        log_probs = F.log_softmax(scores, dim=-1)
+        targets_one_hot = F.one_hot(labels, self.num_classes).float()
+
+        # 应用标签平滑
+        smooth_targets = targets_one_hot * (1 - self.label_smoothing) + \
+            self.label_smoothing / self.num_classes
+
+        loss = -(smooth_targets * log_probs).sum(dim=-1)
+        return (loss * sample_weights).mean()

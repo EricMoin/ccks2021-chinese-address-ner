@@ -1,6 +1,5 @@
 import os
 from result_writer import ResultWriter
-from sentence_reader import SentenceReader
 from config import Config
 from logger import logger
 
@@ -34,8 +33,6 @@ def main():
                          'hfl_chinese-macbert-base_adapted_ep2_seed2025'),
             os.path.join(pretrained_base_dir,
                          'sijunhe_nezha-cn-base_adapted_ep2_seed2025'),
-            os.path.join(pretrained_base_dir, 'chinese-roberta-wwm-ext'),
-            os.path.join(pretrained_base_dir, 'chinese-macbert-base'),
         ]
 
         fold_dirs_to_predict = []

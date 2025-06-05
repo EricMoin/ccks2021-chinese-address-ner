@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from transformers import AutoTokenizer
 from model import BertBiaffineSpanNER
-from trainer import SpanConverter, SpanEvaluator, SpanNERDataset
+from trainer import AddressSpanConverter, SpanEvaluator, AddressSpanNERDataset
 from conll_reader import ConllReader
 from sentence_reader import SentenceReader
 from logger import logger
@@ -48,7 +48,7 @@ class BiaffineSpanPredictor:
             entity_labels = []
 
         # 初始化span转换器
-        self.span_converter = SpanConverter(
+        self.span_converter = AddressSpanConverter(
             labels=entity_labels,
             label_scheme=getattr(self.config.label_map, 'type', 'BIOES')
         )
@@ -547,7 +547,7 @@ class BiaffineSpanPredictor:
             })
 
         # 创建数据集和数据加载器
-        dataset = SpanNERDataset(
+        dataset = AddressSpanNERDataset(
             span_examples,
             self.config.model_name,  # 传递模型名称而非tokenizer对象
             max_length,

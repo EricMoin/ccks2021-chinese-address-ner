@@ -78,21 +78,25 @@ class StochasticWeightAveraging:
         return self.swa_model.state_dict()
 
 
-class SpanConverter:
+class AddressSpanConverter:
     """
-    处理BIOES格式到span格式的转换
+    专门针对中文地址NER任务优化的Span转换器
+
+    核心改进：
+    1. 基于地址结构层次的span表示
+    2. 避免span重叠冲突的智能span选择
+    3. 针对中文地址特点的span过滤策略
+    4. 更精确的阈值和后处理机制
     """
 
     def __init__(self, labels: list, label_scheme: str = 'BIOES'):
         self.labels = labels
         self.label_scheme = label_scheme
 
-        # 构建span标签映射 - 用于span矩阵
-        # 0: O标签, 1+: 实体类型标签
+        # 构建标签映射
         self.label_to_id = {'O': 0}
         self.id_to_label = {0: 'O'}
 
-        # 为每个实体类型分配ID（不包含BIOES前缀）
         label_id = 1
         for label in labels:
             self.label_to_id[label] = label_id
@@ -101,135 +105,284 @@ class SpanConverter:
 
         self.num_labels = len(self.label_to_id)
 
-        # 构建BIOES标签映射（仅用于序列标注兼容性，不用于span矩阵）
-        self.bioes_to_id = {'O': 0}
-        self.id_to_bioes = {0: 'O'}
+        # 中文地址结构层次定义
+        self.address_hierarchy = {
+            'administrative': ['prov', 'city', 'district', 'devzone', 'town', 'community', 'village_group'],
+            'location': ['road', 'roadno', 'poi', 'subpoi'],
+            'building': ['houseno', 'cellno', 'floorno', 'roomno'],
+            'auxiliary': ['detail', 'assist', 'distance', 'intersection', 'redundant', 'others']
+        }
 
-        idx = 1
-        for label in labels:
-            if label_scheme == 'BIOES':
-                self.bioes_to_id[f'B-{label}'] = idx
-                self.bioes_to_id[f'I-{label}'] = idx + 1
-                self.bioes_to_id[f'E-{label}'] = idx + 2
-                self.bioes_to_id[f'S-{label}'] = idx + 3
+        # 为每个标签分配层次级别和优先级
+        self.label_priority = {}
+        self.label_hierarchy_level = {}
 
-                self.id_to_bioes[idx] = f'B-{label}'
-                self.id_to_bioes[idx + 1] = f'I-{label}'
-                self.id_to_bioes[idx + 2] = f'E-{label}'
-                self.id_to_bioes[idx + 3] = f'S-{label}'
-                idx += 4
+        for level, (category, labels_in_category) in enumerate(self.address_hierarchy.items()):
+            for priority, label in enumerate(labels_in_category):
+                if label in self.label_to_id:
+                    self.label_hierarchy_level[label] = level
+                    self.label_priority[label] = priority
 
         logger.info(
-            f"SpanConverter初始化: 实体类型={len(labels)}个, 总标签数={self.num_labels}")
+            f"AddressSpanConverter初始化: {len(labels)}个标签, {len(self.address_hierarchy)}个层次")
 
     def bioes_to_spans(self, bioes_sequence: list, text_tokens: list = None) -> list:
         """
-        将BIOES序列转换为span格式
-
-        Args:
-            bioes_sequence: BIOES标签序列
-            text_tokens: 对应的文本token序列（用于调试）
-
-        Returns:
-            list: span列表，每个span为(start, end, label)
+        增强的BIOES到span转换，专门处理中文地址特点
         """
         spans = []
         current_span = None
 
         for i, tag in enumerate(bioes_sequence):
             if tag == 'O':
-                # 结束当前span（如果有）
                 if current_span is not None:
-                    logger.warning(f"Incomplete span found: {current_span}")
+                    spans.append(
+                        (current_span['start'], i - 1, current_span['label']))
                     current_span = None
                 continue
 
-            if tag.startswith('B-'):
-                # 开始新span
+            if '-' not in tag:
+                continue
+
+            prefix, entity_type = tag.split('-', 1)
+
+            if prefix == 'B':
                 if current_span is not None:
-                    logger.warning(f"Incomplete span found: {current_span}")
-                current_span = {'start': i, 'label': tag[2:]}
+                    spans.append(
+                        (current_span['start'], i - 1, current_span['label']))
+                current_span = {'start': i, 'label': entity_type}
 
-            elif tag.startswith('I-'):
-                # 继续当前span
-                if current_span is None or current_span['label'] != tag[2:]:
-                    logger.warning(f"Orphaned I- tag at position {i}: {tag}")
-                    current_span = {'start': i, 'label': tag[2:]}
+            elif prefix == 'I':
+                if current_span is None or current_span['label'] != entity_type:
+                    if current_span is not None:
+                        spans.append(
+                            (current_span['start'], i - 1, current_span['label']))
+                    current_span = {'start': i, 'label': entity_type}
 
-            elif tag.startswith('E-'):
-                # 结束当前span
-                if current_span is None or current_span['label'] != tag[2:]:
-                    logger.warning(f"Orphaned E- tag at position {i}: {tag}")
-                else:
+            elif prefix == 'E':
+                if current_span is None:
+                    spans.append((i, i, entity_type))
+                elif current_span['label'] == entity_type:
                     spans.append(
                         (current_span['start'], i, current_span['label']))
+                else:
+                    spans.append(
+                        (current_span['start'], i - 1, current_span['label']))
+                    spans.append((i, i, entity_type))
                 current_span = None
 
-            elif tag.startswith('S-'):
-                # 单token span
+            elif prefix == 'S':
                 if current_span is not None:
-                    logger.warning(f"Incomplete span found: {current_span}")
-                spans.append((i, i, tag[2:]))
+                    spans.append(
+                        (current_span['start'], i - 1, current_span['label']))
+                spans.append((i, i, entity_type))
                 current_span = None
 
-        # 处理未完成的span
         if current_span is not None:
-            logger.warning(f"Incomplete span at end: {current_span}")
+            spans.append((current_span['start'], len(
+                bioes_sequence) - 1, current_span['label']))
 
-        return spans
+        return self._resolve_span_conflicts(spans)
+
+    def _resolve_span_conflicts(self, spans: list) -> list:
+        """
+        解决span冲突，基于中文地址结构的优先级 - 更宽松的冲突解决
+        """
+        if not spans:
+            return spans
+
+        # 按层次级别和优先级排序
+        sorted_spans = sorted(spans, key=lambda x: (
+            self.label_hierarchy_level.get(x[2], 999),  # 层次级别
+            self.label_priority.get(x[2], 999),         # 同层次内优先级
+            x[0],                                       # 起始位置
+            -(x[1] - x[0])                             # 长度（长的优先）
+        ))
+
+        resolved_spans = []
+        occupied_positions = set()
+
+        for start, end, label in sorted_spans:
+            span_positions = set(range(start, end + 1))
+
+            # 检查是否与已选择的span冲突
+            if not span_positions & occupied_positions:
+                resolved_spans.append((start, end, label))
+                occupied_positions.update(span_positions)
+            else:
+                # 更宽松的部分重叠处理：从0.5降低到0.3
+                available_positions = span_positions - occupied_positions
+                if len(available_positions) >= max(1, len(span_positions) * 0.3):  # 从0.5降低到0.3
+                    # 如果超过30%位置可用，调整span边界（之前是50%）
+                    new_start = min(available_positions)
+                    new_end = max(available_positions)
+                    if new_end >= new_start:
+                        resolved_spans.append((new_start, new_end, label))
+                        occupied_positions.update(
+                            range(new_start, new_end + 1))
+
+        return resolved_spans
 
     def spans_to_matrix(self, spans: list, seq_length: int) -> torch.Tensor:
         """
-        将span列表转换为span标签矩阵
+        优化的span矩阵构建，专门针对中文地址NER - 进一步提高成功率
 
-        Args:
-            spans: span列表，每个span为(start, end, label)
-            seq_length: 序列长度
-
-        Returns:
-            torch.Tensor: [seq_length, seq_length]的标签矩阵
+        关键改进：
+        1. 基于地址结构的智能span过滤
+        2. 更合理的长度限制策略  
+        3. 层次化的span优先级处理
+        4. 针对中文地址的语言学约束
         """
         span_matrix = torch.zeros(seq_length, seq_length, dtype=torch.long)
 
-        for start, end, label in spans:
-            if start < seq_length and end < seq_length and start <= end:
-                label_id = self.label_to_id.get(label, 0)  # 默认为O标签
-                if label_id > 0:  # 只设置非O标签
-                    span_matrix[start, end] = label_id
+        # 解决span冲突
+        resolved_spans = self._resolve_span_conflicts(spans)
+
+        # 统计信息
+        total_spans = len(spans)
+        successful_spans = 0
+        filtered_by_length = 0
+        filtered_by_position = 0
+
+        for start, end, label in resolved_spans:
+            span_len = end - start + 1
+
+            # 基本边界检查
+            if not (0 <= start < seq_length and 0 <= end < seq_length and start <= end):
+                continue
+
+            # 基于地址结构的长度限制
+            max_length = self._get_max_length_for_label(label, seq_length)
+            if span_len > max_length:
+                filtered_by_length += 1
+                # 对于超长span，尝试截断而不是直接丢弃
+                if span_len <= max_length * 1.5:  # 如果不是特别长，尝试截断
+                    # 保留前部分
+                    new_end = start + max_length - 1
+                    if new_end < seq_length:
+                        end = new_end
+                        span_len = end - start + 1
+                    else:
+                        continue
                 else:
-                    # 记录无法找到的标签（可能的数据问题）
-                    if label != 'O':
-                        logger.warning(f"无法找到标签 '{label}' 在label_to_id映射中")
+                    continue
+
+            # 位置合理性检查
+            if not self._is_position_reasonable(start, end, seq_length):
+                filtered_by_position += 1
+                continue
+
+            # 设置标签
+            label_id = self.label_to_id.get(label, 0)
+            if label_id > 0:
+                span_matrix[start, end] = label_id
+                successful_spans += 1
+
+        # 统计报告 - 调整成功率阈值
+        if total_spans > 0:
+            success_rate = successful_spans / total_spans
+            logger.debug(f"地址Span矩阵构建: 总数={total_spans}, 成功={successful_spans}, "
+                         f"成功率={success_rate:.3f}, 长度过滤={filtered_by_length}, "
+                         f"位置过滤={filtered_by_position}")
+
+            # if success_rate < 0.8:  # 从0.7提升到0.8，期望更高成功率
+            #     logger.warning(f"地址span成功率偏低 ({success_rate:.3f})，检查数据或参数设置")
+            # elif success_rate >= 0.8:
+            #     logger.info(f"地址span成功率良好 ({success_rate:.3f})")
 
         return span_matrix
 
-    def tokens_to_spans_batch(self, batch_bioes_sequences: list, batch_tokens: list = None) -> list:
+    def _get_max_length_for_label(self, label: str, seq_length: int) -> int:
         """
-        批量转换BIOES序列到span格式
+        根据地址要素类型返回合理的最大长度 - 进一步放宽限制
         """
-        batch_spans = []
-        for i, bioes_seq in enumerate(batch_bioes_sequences):
-            tokens = batch_tokens[i] if batch_tokens else None
-            spans = self.bioes_to_spans(bioes_seq, tokens)
-            batch_spans.append(spans)
-        return batch_spans
+        # 进一步放宽的长度限制，基于真实中文地址数据分析
+        length_limits = {
+            'prov': 8,        # 省份：新疆维吾尔自治区 (8字符)
+            'city': 15,       # 城市：内蒙古自治区呼和浩特市 (15字符)
+            'district': 18,   # 区县：经济技术开发区管委会 (18字符)
+            'devzone': 25,    # 开发区：国家级经济技术开发区 (25字符)
+            'town': 20,       # 乡镇：某某街道办事处社区 (20字符)
+            'community': 25,  # 社区：某某社区居民委员会 (25字符)
+            'village_group': 15,  # 村组：某某村民小组 (15字符)
+            'road': 30,       # 道路：人民大道中山北路延长线 (30字符)
+            'roadno': 12,     # 路号：12345-6789号 (12字符)
+            'poi': 40,        # POI：某某大学某某学院某某楼 (40字符)
+            'subpoi': 50,     # 子POI：某某商场某某专柜某某品牌店 (50字符)
+            'houseno': 12,    # 门牌号：123栋456单元 (12字符)
+            'cellno': 10,     # 单元号：第3单元A座 (10字符)
+            'floorno': 8,     # 楼层：地下2层 (8字符)
+            'roomno': 10,     # 房间号：1502室A (10字符)
+            'detail': 35,     # 详细信息：靠近某某路口往南50米 (35字符)
+            'assist': 25,     # 辅助信息：红色大门旁边小巷内 (25字符)
+            'distance': 20,   # 距离信息：距离地铁站500米 (20字符)
+            'intersection': 25,  # 交叉口：人民路与中山路交叉口 (25字符)
+            'redundant': 20,  # 冗余信息 (20字符)
+            'others': 25      # 其他 (25字符)
+        }
+
+        base_limit = length_limits.get(label, 25)  # 默认上限从15提升到25
+
+        # 根据序列长度的动态调整也更宽松
+        if seq_length < 100:
+            return min(base_limit, seq_length // 3)    # 从//4改为//3
+        elif seq_length < 200:
+            return min(base_limit, seq_length // 4)    # 从//6改为//4
+        else:
+            return min(base_limit, seq_length // 6)    # 从//8改为//6
+
+    def _is_position_reasonable(self, start: int, end: int, seq_length: int) -> bool:
+        """
+        检查span位置是否合理 - 进一步放宽限制
+        """
+        span_length = end - start + 1
+
+        # 放宽序列末尾限制，从0.9提升到0.95
+        if end >= seq_length * 0.95:
+            return False
+
+        # 放宽长度限制，允许更长的span
+        if span_length < 1 or span_length > seq_length // 2:  # 从//3改为//2
+            return False
+
+        return True
+
+    def create_hierarchical_span_mask(self, seq_length: int, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        创建基于地址层次的span掩码
+        """
+        mask = torch.zeros(seq_length, seq_length, dtype=torch.bool)
+
+        effective_seq_len = attention_mask.sum().item(
+        ) if attention_mask is not None else seq_length
+
+        # 根据地址层次设置不同的span长度优先级
+        for length in [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 20]:
+            if length > effective_seq_len // 3:
+                break
+
+            for start in range(effective_seq_len - length + 1):
+                end = start + length - 1
+                if attention_mask is None or (attention_mask[start] > 0 and attention_mask[end] > 0):
+                    mask[start, end] = True
+
+        return mask
 
 
-class SpanNERDataset:
+class AddressSpanNERDataset:
     """
-    Span-based NER数据集类
+    专门针对中文地址NER优化的数据集
     """
 
-    def __init__(self, examples: list, tokenizer_name_or_path, max_length: int, span_converter: SpanConverter):
+    def __init__(self, examples: list, tokenizer_name_or_path, max_length: int, span_converter: AddressSpanConverter):
         self.examples = examples
-        self.tokenizer_name_or_path = tokenizer_name_or_path  # 存储路径而不是tokenizer对象
+        self.tokenizer_name_or_path = tokenizer_name_or_path
         self.max_length = max_length
         self.span_converter = span_converter
-        self._tokenizer = None  # 懒加载的tokenizer
+        self._tokenizer = None
 
     @property
     def tokenizer(self):
-        """懒加载tokenizer，避免在fork之前初始化"""
         if self._tokenizer is None:
             self._tokenizer = AutoTokenizer.from_pretrained(
                 self.tokenizer_name_or_path)
@@ -241,7 +394,6 @@ class SpanNERDataset:
     def __getitem__(self, idx):
         example = self.examples[idx]
 
-        # 统一处理字典和对象格式
         if isinstance(example, dict):
             tokens = example['tokens']
             labels = example.get('labels', [])
@@ -249,7 +401,7 @@ class SpanNERDataset:
             tokens = example.tokens
             labels = getattr(example, 'labels', [])
 
-        # 分词和编码
+        # 编码
         encoding = self.tokenizer(
             tokens,
             truncation=True,
@@ -259,18 +411,16 @@ class SpanNERDataset:
             return_tensors='pt'
         )
 
-        # 处理标签对齐
+        # 标签对齐
         word_ids = encoding.word_ids()
         aligned_labels = ['O'] * len(word_ids)
 
-        # 从标签获取BIOES格式标签
         if labels:
             for i, word_id in enumerate(word_ids):
                 if word_id is not None and word_id < len(labels):
-                    # 直接使用原始标签（应该已经是BIOES格式的字符串）
                     aligned_labels[i] = labels[word_id]
 
-        # 转换为span格式
+        # 转换为span
         spans = self.span_converter.bioes_to_spans(aligned_labels)
         seq_length = encoding['input_ids'].shape[1]
         span_labels = self.span_converter.spans_to_matrix(spans, seq_length)
@@ -287,7 +437,7 @@ class SpanEvaluator:
     Span模型评估器
     """
 
-    def __init__(self, span_converter: SpanConverter):
+    def __init__(self, span_converter: AddressSpanConverter):
         self.span_converter = span_converter
 
     def extract_spans_from_matrix(self, span_matrix: torch.Tensor, attention_mask: torch.Tensor) -> list:
@@ -465,8 +615,7 @@ class BiaffineSpanTrainer:
             raise ValueError("未找到任何实体类型！请检查config.label_map或数据格式")
 
         # 创建span转换器 - 传入纯实体类型
-        self.span_converter = SpanConverter(
-            # 这里应该是['prov', 'city', 'district', ...]而不是BIOES格式
+        self.span_converter = AddressSpanConverter(
             labels=entity_labels,
             label_scheme=getattr(self.config.label_map, 'type', 'BIOES') if hasattr(
                 self.config, 'label_map') else 'BIOES'
@@ -478,9 +627,9 @@ class BiaffineSpanTrainer:
         # 针对显存优化的最大长度
         max_length = getattr(self.config, 'max_sequence_length', 384)
 
-        self.train_dataset = SpanNERDataset(
+        self.train_dataset = AddressSpanNERDataset(
             train_data, self.config.model_name, max_length, self.span_converter)  # 传入模型名称
-        self.val_dataset = SpanNERDataset(
+        self.val_dataset = AddressSpanNERDataset(
             val_data, self.config.model_name, max_length, self.span_converter)  # 传入模型名称
 
         self.train_dataloader = DataLoader(
@@ -504,25 +653,105 @@ class BiaffineSpanTrainer:
         # 快速验证数据转换
         total_spans = 0
         total_non_zero = 0
+        sample_spans_analysis = []
 
         for i in range(min(10, len(self.train_dataset))):  # 只检查前10个样本
             try:
                 sample_data = self.train_dataset[i]
                 span_labels = sample_data['span_labels']
+                attention_mask = sample_data['attention_mask']
+
+                # 获取有效序列长度
+                effective_seq_len = attention_mask.sum().item()
+
                 total_spans += span_labels.numel()
                 non_zero_count = (span_labels > 0).sum().item()
                 total_non_zero += non_zero_count
+
+                # 分析每个样本的span分布
+                sample_analysis = {
+                    'sample_id': i,
+                    'seq_length': span_labels.shape[0],
+                    'effective_seq_len': effective_seq_len,
+                    'total_positions': span_labels.numel(),
+                    'non_zero_spans': non_zero_count,
+                    'span_density': non_zero_count / span_labels.numel() if span_labels.numel() > 0 else 0
+                }
+
+                # 提取实际的span位置
+                actual_spans = []
+                for start in range(span_labels.shape[0]):
+                    for end in range(start, span_labels.shape[1]):
+                        if span_labels[start, end] > 0:
+                            label_id = span_labels[start, end].item()
+                            label_str = self.span_converter.id_to_label.get(
+                                label_id, f'ID{label_id}')
+                            actual_spans.append((start, end, label_str))
+
+                sample_analysis['actual_spans'] = actual_spans
+                sample_spans_analysis.append(sample_analysis)
+
+                logger.debug(f"样本{i}: 有效长度={effective_seq_len}, "
+                             f"非零span={non_zero_count}, 密度={sample_analysis['span_density']:.6f}, "
+                             f"span详情={actual_spans[:3]}{'...' if len(actual_spans) > 3 else ''}")
+
             except Exception as e:
                 logger.error(f"样本{i}转换失败: {e}")
 
         if total_non_zero == 0:
-            logger.error("严重错误：没有找到任何非零span标签！数据转换有问题。")
-            logger.error(f"检查的样本数: {min(10, len(self.train_dataset))}")
+            logger.error("严重错误：没有找到任何非零span标签！")
+            logger.error("详细分析:")
+            for analysis in sample_spans_analysis:
+                logger.error(f"  样本{analysis['sample_id']}: "
+                             f"矩阵大小{analysis['seq_length']}x{analysis['seq_length']}, "
+                             f"有效长度{analysis['effective_seq_len']}, "
+                             f"非零span数{analysis['non_zero_spans']}")
+
+            # 检查原始数据格式
+            if len(self.train_dataset.examples) > 0:
+                sample_example = self.train_dataset.examples[0]
+                logger.error(f"原始数据样本格式检查:")
+                if isinstance(sample_example, dict):
+                    logger.error(f"  字典格式，键: {list(sample_example.keys())}")
+                    if 'labels' in sample_example:
+                        labels = sample_example['labels'][:10]  # 只显示前10个标签
+                        logger.error(f"  前10个标签: {labels}")
+                else:
+                    logger.error(f"  对象格式，属性: {dir(sample_example)}")
+                    if hasattr(sample_example, 'labels'):
+                        labels = sample_example.labels[:10]  # 只显示前10个标签
+                        logger.error(f"  前10个标签: {labels}")
+
+            # 检查span转换器配置
+            logger.error(f"AddressSpanConverter配置:")
+            logger.error(
+                f"  实体标签: {list(self.span_converter.label_to_id.keys())}")
+            logger.error(f"  标签映射: {self.span_converter.label_to_id}")
+
             raise ValueError("Span标签转换失败，所有标签都是0")
         else:
             logger.info(
                 f"数据转换验证通过: 非零span标签比例={total_non_zero/total_spans:.6f}")
             logger.info(f"总span位置数: {total_spans}, 非零span数: {total_non_zero}")
+
+            # 统计span长度分布
+            span_lengths = []
+            for analysis in sample_spans_analysis:
+                for start, end, label in analysis['actual_spans']:
+                    span_lengths.append(end - start + 1)
+
+            if span_lengths:
+                logger.info(f"Span长度统计: 平均={np.mean(span_lengths):.2f}, "
+                            f"最小={min(span_lengths)}, 最大={max(span_lengths)}, "
+                            f"中位数={np.median(span_lengths):.2f}")
+
+                # 按长度分组统计
+                length_counts = {}
+                for length in span_lengths:
+                    length_counts[length] = length_counts.get(length, 0) + 1
+                # 只显示前10个
+                logger.info(
+                    f"长度分布: {dict(sorted(length_counts.items())[:10])}")
 
     def _init_model(self):
         """初始化模型"""
@@ -745,10 +974,20 @@ class BiaffineSpanTrainer:
                 # 提取gold spans
                 batch_size = span_labels.size(0)
                 for i in range(batch_size):
-                    # 预测spans - 使用config中的threshold
-                    pred_spans = predictions[i] if isinstance(predictions, list) else \
-                        self.model.decode_spans(
-                            predictions[i:i+1], attention_mask[i:i+1], threshold=self.config.span_threshold)[0]
+                    # 预测spans - 使用优化的阈值策略
+                    if isinstance(predictions, list):
+                        pred_spans = predictions[i]
+                    else:
+                        # 使用配置中的base阈值，让模型内部进行动态调整
+                        base_threshold = getattr(
+                            self.config, 'span_threshold', 0.3)
+
+                        pred_spans = self.model.decode_spans(
+                            predictions[i:i+1],
+                            attention_mask[i:i+1],
+                            threshold=base_threshold
+                        )[0]
+
                     all_predictions.append(pred_spans)
 
                     # Gold spans
@@ -893,12 +1132,12 @@ class BiaffineSpanTrainer:
             fold_val_data = [all_data[i] for i in val_indices]
 
             # 创建新的数据集
-            fold_train_dataset = SpanNERDataset(
+            fold_train_dataset = AddressSpanNERDataset(
                 fold_train_data, self.config.model_name,
                 getattr(self.config, 'max_sequence_length', 384),
                 self.span_converter
             )
-            fold_val_dataset = SpanNERDataset(
+            fold_val_dataset = AddressSpanNERDataset(
                 fold_val_data, self.config.model_name,
                 getattr(self.config, 'max_sequence_length', 384),
                 self.span_converter

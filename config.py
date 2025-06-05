@@ -42,6 +42,12 @@ class Config:
     focal_loss_alpha: float       # Focal Loss的alpha参数
     focal_loss_gamma: float       # Focal Loss的gamma参数
 
+    # 新增的混合损失权重参数
+    focal_weight: float           # Focal loss权重
+    ce_weight: float             # 交叉熵损失权重
+    dice_weight: float           # Dice loss权重
+    label_smoothing: float       # 标签平滑参数
+
     # Dropout相关
     spatial_dropout: float    # 空间dropout率
     embedding_dropout: float  # 嵌入层dropout率
@@ -59,7 +65,13 @@ class Config:
     span_loss_weight: float      # span损失的权重
     biaffine_hidden_dim: int     # biaffine attention的隐藏维度
     span_dropout: float          # span分类器的dropout率
-    span_loss_type: str          # span损失函数类型
+
+    # Advanced Span Matrix Optimization 新增优化参数
+    use_sparse_spans: bool           # 使用稀疏span表示以减少内存占用
+    enable_intelligent_filtering: bool  # 启用智能span过滤
+    enable_linguistic_constraints: bool  # 启用基于中文地址的语言学约束
+    dynamic_max_span_length: bool   # 动态调整最大span长度
+    span_efficiency_mode: str       # 效率模式: 'memory', 'speed', 'balanced'
 
     # 其他配置
     seed: int    # 随机种子
@@ -109,6 +121,12 @@ class Config:
         self.focal_loss_alpha = config_dict.get('focal_loss_alpha', 0.25)
         self.focal_loss_gamma = config_dict.get('focal_loss_gamma', 1.5)
 
+        # 新增混合损失权重参数
+        self.focal_weight = config_dict.get('focal_weight', 0.7)
+        self.ce_weight = config_dict.get('ce_weight', 0.3)
+        self.dice_weight = config_dict.get('dice_weight', 0.2)
+        self.label_smoothing = config_dict.get('label_smoothing', 0.1)
+
         # 设置Dropout相关
         self.spatial_dropout = config_dict.get('spatial_dropout', 0.15)
         self.embedding_dropout = config_dict.get('embedding_dropout', 0.15)
@@ -127,7 +145,17 @@ class Config:
         self.span_loss_weight = config_dict.get('span_loss_weight', 1.0)
         self.biaffine_hidden_dim = config_dict.get('biaffine_hidden_dim', 512)
         self.span_dropout = config_dict.get('span_dropout', 0.1)
-        self.span_loss_type = config_dict.get('span_loss_type', 'combined')
+
+        # 设置Advanced Span Matrix Optimization 新增优化参数
+        self.use_sparse_spans = config_dict.get('use_sparse_spans', False)
+        self.enable_intelligent_filtering = config_dict.get(
+            'enable_intelligent_filtering', False)
+        self.enable_linguistic_constraints = config_dict.get(
+            'enable_linguistic_constraints', False)
+        self.dynamic_max_span_length = config_dict.get(
+            'dynamic_max_span_length', False)
+        self.span_efficiency_mode = config_dict.get(
+            'span_efficiency_mode', 'memory')
 
         # 设置其他配置
         self.seed = config_dict.get('seed', 2024)
