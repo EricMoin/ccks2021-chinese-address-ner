@@ -270,10 +270,21 @@ class BiaffineSpanPredictor:
 
             # 预测
             with torch.no_grad():
-                # 获取span预测结果
-                span_predictions = self.model(
+                # 确保模型处于评估模式
+                self.model.eval()
+
+                # 获取span logits
+                span_logits = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask
+                )
+
+                # 使用模型的decode_spans方法解码span
+                threshold = getattr(self.config, 'span_threshold', 0.15)
+                span_predictions = self.model.decode_spans(
+                    span_logits,  # span_logits已经包含batch维度
+                    attention_mask,
+                    threshold=threshold
                 )
 
                 # 将span预测转换为序列标签
