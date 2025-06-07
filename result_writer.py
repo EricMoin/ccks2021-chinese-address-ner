@@ -1,6 +1,10 @@
 from collections import Counter
 import glob
 import os
+import copy
+import re
+import torch
+from typing import Dict, List, Optional
 
 from config import Config
 from predictor import BiaffineSpanPredictor
@@ -9,8 +13,159 @@ from logger import logger
 
 
 class ResultWriter:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, model_weights: Optional[Dict[str, float]] = None):
         self.config = config
+        # model_weights 格式: {"model_name": weight}
+        self.model_weights = model_weights or {}
+        self.use_soft_voting = bool(model_weights)
+
+        if self.use_soft_voting:
+            logger.info(f"使用软投票，模型权重: {self.model_weights}")
+        else:
+            logger.info("使用硬投票（多数投票）")
+
+    def _get_model_name_from_path(self, fold_dir_path: str) -> str:
+        """从fold目录路径中提取模型名称"""
+        model_name = re.sub(r'(/swa_model\.pt)|(/best_model\.pt)',
+                            r'', fold_dir_path)
+        model_name = re.sub(r'result/pretrained/',
+                            r'', model_name)
+        model_name = re.sub(r'_adapted_ep[\d]+_seed[\d]+',
+                            r'', model_name)
+        model_name = model_name.replace(r"_", '/')
+        return model_name
+
+    def _normalize_weights(self, weights: Dict[str, float]) -> Dict[str, float]:
+        """归一化权重，使其总和为1"""
+        total_weight = sum(weights.values())
+        if total_weight == 0:
+            logger.warning("权重总和为0，使用均匀权重")
+            return {k: 1.0 / len(weights) for k in weights.keys()}
+        return {k: v / total_weight for k, v in weights.items()}
+
+    def _ensemble_predictions_soft_voting(self,
+                                          all_predictions: List[List[List[str]]],
+                                          model_names: List[str],
+                                          num_test_examples: int,
+                                          original_test_char_sequences: List[List[str]]) -> List[List[str]]:
+        """
+        使用软投票进行模型集成
+
+        Args:
+            all_predictions: 所有模型的预测结果
+            model_names: 模型名称列表
+            num_test_examples: 测试样本数量
+            original_test_char_sequences: 原始测试字符序列
+
+        Returns:
+            集成后的预测标签
+        """
+        logger.info("开始软投票集成...")
+
+        # 准备模型权重
+        active_weights = {}
+        for model_name in model_names:
+            if model_name in self.model_weights:
+                active_weights[model_name] = self.model_weights[model_name]
+            else:
+                # 如果模型不在权重字典中，给予默认权重
+                active_weights[model_name] = 1.0
+                logger.warning(f"模型 {model_name} 不在权重配置中，使用默认权重 1.0")
+
+        # 归一化权重
+        active_weights = self._normalize_weights(active_weights)
+        logger.info(f"归一化后的模型权重: {active_weights}")
+
+        ensembled_final_labels = []
+
+        for example_idx in range(num_test_examples):
+            char_seq_len = len(original_test_char_sequences[example_idx])
+            example_ensembled_labels = []
+
+            for token_idx in range(char_seq_len):
+                # 收集所有模型对该位置的预测
+                label_scores = {}  # {label: weighted_score}
+
+                for model_idx, (predictions, model_name) in enumerate(zip(all_predictions, model_names)):
+                    if example_idx < len(predictions) and token_idx < len(predictions[example_idx]):
+                        predicted_label = predictions[example_idx][token_idx]
+                        weight = active_weights.get(model_name, 0.0)
+
+                        if predicted_label not in label_scores:
+                            label_scores[predicted_label] = 0.0
+                        label_scores[predicted_label] += weight
+                    else:
+                        # 处理缺失预测的情况
+                        weight = active_weights.get(model_name, 0.0)
+                        if 'O' not in label_scores:
+                            label_scores['O'] = 0.0
+                        label_scores['O'] += weight
+                        logger.debug(
+                            f"预测缺失 example {example_idx}, token {token_idx} from model {model_name}. 默认为 'O'.")
+
+                # 选择得分最高的标签
+                if label_scores:
+                    best_label = max(label_scores.keys(),
+                                     key=lambda x: label_scores[x])
+                    example_ensembled_labels.append(best_label)
+                else:
+                    logger.warning(
+                        f"没有找到有效预测 example {example_idx}, token {token_idx}. 默认为 'O'.")
+                    example_ensembled_labels.append('O')
+
+            ensembled_final_labels.append(example_ensembled_labels)
+
+        logger.info("软投票集成完成")
+        return ensembled_final_labels
+
+    def _ensemble_predictions_hard_voting(self,
+                                          all_predictions: List[List[List[str]]],
+                                          num_test_examples: int,
+                                          original_test_char_sequences: List[List[str]]) -> List[List[str]]:
+        """
+        使用硬投票进行模型集成（原有逻辑）
+
+        Args:
+            all_predictions: 所有模型的预测结果
+            num_test_examples: 测试样本数量
+            original_test_char_sequences: 原始测试字符序列
+
+        Returns:
+            集成后的预测标签
+        """
+        logger.info("开始硬投票集成...")
+
+        ensembled_final_labels = []
+
+        for example_idx in range(num_test_examples):
+            char_seq_len = len(original_test_char_sequences[example_idx])
+            example_ensembled_labels_for_tokens = []
+
+            for token_idx in range(char_seq_len):
+                votes_for_this_token = []
+
+                for source_idx, source_predictions in enumerate(all_predictions):
+                    if example_idx < len(source_predictions) and token_idx < len(source_predictions[example_idx]):
+                        votes_for_this_token.append(
+                            source_predictions[example_idx][token_idx])
+                    else:
+                        logger.debug(
+                            f"Vote missing for example {example_idx}, token {token_idx} from source {source_idx}. Defaulting to 'O'.")
+                        votes_for_this_token.append('O')
+
+                if not votes_for_this_token:
+                    logger.warning(
+                        f"No votes for example {example_idx}, token {token_idx}. Defaulting to 'O'.")
+                    majority_label = 'O'
+                else:
+                    vote_counts = Counter(votes_for_this_token)
+                    majority_label = vote_counts.most_common(1)[0][0]
+
+                example_ensembled_labels_for_tokens.append(majority_label)
+            ensembled_final_labels.append(example_ensembled_labels_for_tokens)
+
+        logger.info("硬投票集成完成")
+        return ensembled_final_labels
 
     def discover_work_dirs(self, main_work_dir: str, model_name_pattern: str = "*_adapted_ep*_seed*") -> list[str]:
         """
@@ -187,16 +342,25 @@ class ResultWriter:
                 "No fold work directories provided or discovered. Cannot run prediction.")
             return
 
-        # 初始化预测器，使用配置中的模型设置
-        predictor = BiaffineSpanPredictor(config=self.config)
-
-        # 存储所有折叠的预测结果
+        # 存储所有折叠的预测结果和对应的模型名称
         all_test_predictions_sources = []
+        model_names = []
 
         # 遍历每个折叠目录进行预测
         for fold_dir_path in fold_work_dirs:
             logger.info(
                 f"--- Generating predictions for fold: {fold_dir_path} ---")
+
+            # 提取模型名称
+            model_name = self._get_model_name_from_path(fold_dir_path)
+
+            # 为当前模型创建特定的配置和预测器
+            config = copy.deepcopy(self.config)
+            config.model_name = model_name
+            predictor = BiaffineSpanPredictor(config=config)
+
+            logger.info(f"为模型 {model_name} 创建专用预测器")
+
             # 获取当前折叠的预测结果
             fold_predictions = predictor.get_predictions_for_fold(
                 fold_work_dir=fold_dir_path,
@@ -208,9 +372,17 @@ class ResultWriter:
             # 如果成功生成预测，则添加到结果列表中
             if fold_predictions:
                 all_test_predictions_sources.append(fold_predictions)
+                model_names.append(model_name)
+                logger.info(f"成功收集模型 {model_name} 的预测结果")
             else:
                 logger.warning(
                     f"No predictions returned from fold: {fold_dir_path}. Skipping for ensembling.")
+
+            # 清理当前预测器以释放显存
+            del predictor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info(f"已清理模型 {model_name} 的显存")
 
         # 检查是否收集到任何预测结果
         if not all_test_predictions_sources:
@@ -221,48 +393,35 @@ class ResultWriter:
         # 记录收集到的预测源数量
         logger.info(
             f"Collected predictions from {len(all_test_predictions_sources)} sources for ensembling.")
+        logger.info(f"模型列表: {model_names}")
 
         # 读取原始测试数据
         sentence_reader = SentenceReader()
         original_test_char_sequences = sentence_reader.read_tokens(
             file_path=self.config.test_file)
         num_test_examples = len(original_test_char_sequences)
-        ensembled_final_labels = []  # 存储最终的集成标签
 
-        # 对每个测试样本进行投票集成
-        for example_idx in range(num_test_examples):
-            char_seq_len = len(original_test_char_sequences[example_idx])
-            example_ensembled_labels_for_tokens = []
-            # 对每个字符位置进行投票
-            for token_idx in range(char_seq_len):
-                votes_for_this_token = []
-                # 收集所有折叠对该位置的预测
-                for source_idx, source_predictions in enumerate(all_test_predictions_sources):
-                    if example_idx < len(source_predictions) and token_idx < len(source_predictions[example_idx]):
-                        votes_for_this_token.append(
-                            source_predictions[example_idx][token_idx])
-                    else:
-                        # 处理缺失预测的情况
-                        logger.debug(
-                            f"Vote missing for example {example_idx}, token {token_idx} from source {source_idx}. Defaulting to 'O'.")
-                        votes_for_this_token.append('O')
-
-                # 处理没有投票的情况
-                if not votes_for_this_token:
-                    logger.warning(
-                        f"No votes for example {example_idx}, token {token_idx}. Defaulting to 'O'.")
-                    majority_label = 'O'
-                else:
-                    # 统计投票结果并选择多数标签
-                    vote_counts = Counter(votes_for_this_token)
-                    majority_label = vote_counts.most_common(1)[0][0]
-                example_ensembled_labels_for_tokens.append(majority_label)
-            ensembled_final_labels.append(example_ensembled_labels_for_tokens)
+        # 根据配置选择投票方式
+        if self.use_soft_voting:
+            ensembled_final_labels = self._ensemble_predictions_soft_voting(
+                all_predictions=all_test_predictions_sources,
+                model_names=model_names,
+                num_test_examples=num_test_examples,
+                original_test_char_sequences=original_test_char_sequences
+            )
+        else:
+            ensembled_final_labels = self._ensemble_predictions_hard_voting(
+                all_predictions=all_test_predictions_sources,
+                num_test_examples=num_test_examples,
+                original_test_char_sequences=original_test_char_sequences
+            )
 
         os.makedirs(self.config.work_dir, exist_ok=True)
 
+        # 根据投票方式生成不同的输出文件名
+        voting_type = "soft" if self.use_soft_voting else "hard"
         ensembled_conll_output_path = os.path.join(
-            self.config.work_dir, "ensembled_predictions_pipeline.conll")
+            self.config.work_dir, f"ensembled_predictions_pipeline_{voting_type}.conll")
 
         # 写入集成预测结果
         write_ok = self.write_ensembled_predictions_conll_format(
@@ -273,10 +432,16 @@ class ResultWriter:
 
         # 如果成功写入，则处理最终提交输出
         if write_ok:
+            # 生成对应的提交文件名
+            output_file_parts = os.path.splitext(self.config.output_file)
+            final_output_file = f"{output_file_parts[0]}_{voting_type}{output_file_parts[1]}"
+
             self.process_final_submission_output(
                 ensembled_conll_pred_file=ensembled_conll_output_path,
-                final_submission_file=self.config.output_file,
+                final_submission_file=final_output_file,
                 original_test_file_path=self.config.test_file
             )
+            logger.info(f"最终提交文件已生成: {final_output_file}")
+
         # 记录流程完成日志
         logger.info("--- Prediction and Ensembling Pipeline Finished ---")
