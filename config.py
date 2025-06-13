@@ -73,6 +73,15 @@ class Config:
     dynamic_max_span_length: bool   # 动态调整最大span长度
     span_efficiency_mode: str       # 效率模式: 'memory', 'speed', 'balanced'
 
+    # 添加缺失的层次化和多头biaffine参数
+    use_hierarchical: bool
+    fusion_layers: int
+    biaffine_heads: int
+    use_boundary_detection: bool
+    boundary_loss_weight: float
+    hierarchy_loss_weight: float
+    use_focal_loss: bool
+
     # 其他配置
     seed: int    # 随机种子
     k_folds: int  # K折交叉验证的折数
@@ -156,6 +165,18 @@ class Config:
             'dynamic_max_span_length', False)
         self.span_efficiency_mode = config_dict.get(
             'span_efficiency_mode', 'memory')
+
+        # 添加缺失的层次化和多头biaffine参数
+        self.use_hierarchical = config_dict.get('use_hierarchical', False)
+        self.fusion_layers = config_dict.get('fusion_layers', 4)
+        self.biaffine_heads = config_dict.get('biaffine_heads', 4)
+        self.use_boundary_detection = config_dict.get(
+            'use_boundary_detection', False)
+        self.boundary_loss_weight = config_dict.get(
+            'boundary_loss_weight', 0.5)
+        self.hierarchy_loss_weight = config_dict.get(
+            'hierarchy_loss_weight', 0.5)
+        self.use_focal_loss = config_dict.get('use_focal_loss', True)
 
         # 设置其他配置
         self.seed = config_dict.get('seed', 2024)

@@ -496,10 +496,11 @@ class MultiHeadBiaffineAttention(nn.Module):
 
         self.dropout = nn.Dropout(0.1)
 
-    def forward(self, sequence_output):
+    def forward(self, sequence_output, attention_mask=None):
         """
         Args:
             sequence_output: [batch_size, seq_len, hidden_size]
+            attention_mask: [batch_size, seq_len] 注意力掩码（可选，用于保持接口一致性）
         Returns:
             span_logits: [batch_size, seq_len, seq_len, num_labels]
         """
@@ -527,8 +528,12 @@ class MultiHeadBiaffineAttention(nn.Module):
             temp = torch.einsum('bsh,hlk->bslk', start_repr, biaffine_weight)
 
             # temp: [batch, seq, num_labels, head_dim] @ end_repr: [batch, seq, head_dim]
-            # 输出: [batch, seq, num_labels, seq] -> [batch, seq, seq, num_labels]
+            # 输出: [batch, seq, num_labels, seq] -> 需要转换为 [batch, seq, seq, num_labels]
             head_logits = torch.einsum('bslk,btk->bslt', temp, end_repr)
+
+            # 转换维度：[batch, seq, num_labels, seq] -> [batch, seq, seq, num_labels]
+            # [batch, seq, seq, num_labels]
+            head_logits = head_logits.permute(0, 1, 3, 2)
 
             head_outputs.append(head_logits)
 
