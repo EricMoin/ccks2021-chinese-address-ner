@@ -1,0 +1,9 @@
+torch
+transformers
+scikit-learn
+numpy
+matplotlib
+seaborn
+tqdm
+pyyaml
+TorchCRF 

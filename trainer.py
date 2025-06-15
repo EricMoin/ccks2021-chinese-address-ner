@@ -14,6 +14,7 @@ from conll_reader import ConllReader, MultiConllReader
 from dataset import NERDataset, NERTestDataset
 from model import FreeLB, AddressNER
 from label import LabelMap
+from visualization import TrainingVisualizer
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,9 @@ class Trainer:
         self.val_dataloader = val_dataloader
         self.device = torch.device(device)
         self.scheduler = None  # 初始化调度器属性
+
+        # 初始化训练可视化工具
+        self.visualizer = TrainingVisualizer(self.config.work_dir)
 
         # 如果启用则初始化SWA
         if self.config.use_swa:
@@ -286,6 +290,19 @@ class Trainer:
             )
             micro_f1 = report_dict['weighted avg']['f1-score']
             current_val_metric = micro_f1  # 使用 Micro-F1 作为 val metric
+
+            # 计算真正的验证准确率（之前的current_val_metric实际上是正确率）
+            val_accuracy = correct_eval / total_eval
+
+            # 记录当前epoch的训练指标到可视化工具
+            self.visualizer.record_epoch(
+                epoch=epoch,
+                train_loss=avg_train_loss,
+                val_loss=avg_eval_loss,
+                val_f1=micro_f1,
+                val_accuracy=val_accuracy
+            )
+
             if current_val_metric > best_val_metric:
                 best_val_metric = current_val_metric
                 saved_path = os.path.join(
@@ -302,6 +319,10 @@ class Trainer:
                 torch.save(swa_model_state_dict, swa_save_path)
                 logger.info(
                     f"保存最终SWA模型 ({os.path.basename(self.config.work_dir)}) 到 {swa_save_path}")
+
+        # 完成训练可视化，生成并保存图表
+        self.visualizer.finalize_training_visualization()
+
         logger.info(
             f"工作目录训练完成: {self.config.work_dir}")
 
