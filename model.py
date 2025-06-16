@@ -134,9 +134,6 @@ class AddressNER(nn.Module):
             # 推理期间，解码最佳路径
             return self.crf.viterbi_decode(logits, mask=attention_mask.bool())
 
-    def __len__(self):
-        return len(self.data)
-
 
 class FreeLB:
     def __init__(self, model, adv_lr=1e-1, adv_steps=3, adv_init_mag=2e-2, adv_max_norm=0.0, adv_norm_type='l2', base_model='bert'):
